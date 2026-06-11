@@ -122,6 +122,40 @@ def test_pr_guard_rejects_beta_metadata_from_noncanonical_branch(tmp_path: Path)
     assert "release/beta-1.20.0-beta.3" in result.stderr
 
 
+def test_pr_guard_accepts_dependency_only_release_managed_file_edits(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    init_repo_with_beta_commit(repo)
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "codex-lb"\nversion = "1.20.0-beta.3"\ndependencies = ["aiohttp-socks>=0.10.1"]\n',
+        encoding="utf-8",
+    )
+    (repo / "uv.lock").write_text(
+        '[[package]]\nname = "codex-lb"\nversion = "1.20.0-beta.3"\nsource = { editable = "." }\n'
+        'dependencies = [{ name = "aiohttp-socks" }]\n',
+        encoding="utf-8",
+    )
+    git(repo, "add", "pyproject.toml", "uv.lock")
+    git(repo, "commit", "-m", "deps: add aiohttp socks adapter")
+    sha = git(repo, "rev-parse", "HEAD")
+    branch = "fix/aiohttp-socks-adapter"
+    event = event_file(tmp_path, head_ref=branch, head_sha=sha, body="")
+
+    result = run_guard(
+        Path(__file__).resolve().parents[2],
+        repo,
+        "--base-ref",
+        "HEAD~1",
+        "--head-ref",
+        branch,
+        "--event-path",
+        str(event),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "No release-managed version files changed" in result.stdout
+
+
 def test_pr_guard_rejects_inconsistent_release_managed_beta_metadata(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -154,6 +188,43 @@ def test_pr_guard_rejects_inconsistent_release_managed_beta_metadata(tmp_path: P
     assert "Release-managed version files must agree" in result.stderr
     assert "app/__init__.py='1.20.0-beta.3'" in result.stderr
     assert "pyproject.toml='1.20.0'" in result.stderr
+
+
+def test_pr_guard_accepts_dependency_only_package_json_edits_on_beta_base(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    write_minimal_release_files(repo, version="1.20.0-beta.3")
+    git(repo, "init")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "init")
+    git(repo, "branch", "-M", "main")
+
+    package_json = repo / "frontend" / "package.json"
+    package_json.write_text(
+        json.dumps({"name": "frontend", "version": "1.20.0-beta.3", "dependencies": {"radix-ui": "^1.5.0"}}) + "\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", "frontend/package.json")
+    git(repo, "commit", "-m", "chore(deps): bump frontend dependencies")
+    sha = git(repo, "rev-parse", "HEAD")
+    branch = "dependabot/bun/frontend/frontend-minor-patch"
+    event = event_file(tmp_path, head_ref=branch, head_sha=sha, body="")
+
+    result = run_guard(
+        Path(__file__).resolve().parents[2],
+        repo,
+        "--base-ref",
+        "HEAD~1",
+        "--head-ref",
+        branch,
+        "--event-path",
+        str(event),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "No release-managed version files changed" in result.stdout
 
 
 def test_pr_guard_rejects_canonical_beta_pr_without_validation_evidence(tmp_path: Path) -> None:

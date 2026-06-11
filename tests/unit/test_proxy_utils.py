@@ -4070,6 +4070,34 @@ async def test_stream_responses_websocket_omits_http_only_transport_fields(monke
 
 
 @pytest.mark.asyncio
+async def test_stream_codex_websocket_events_raises_sanitized_transport_error_on_ws_error():
+    websocket = _WsResponse(
+        [
+            _WsMessage(
+                proxy_module.aiohttp.WSMsgType.ERROR,
+                OSError("proxy http://user:pass@proxy.local:8080 websocket failed"),
+            )
+        ]
+    )
+
+    with pytest.raises(proxy_module.CodexTransportError) as exc_info:
+        _ = [
+            event
+            async for event in proxy_module._stream_codex_websocket_events(
+                websocket,
+                idle_timeout_seconds=45.0,
+                total_timeout_seconds=60.0,
+                max_event_bytes=1024,
+            )
+        ]
+
+    message = str(exc_info.value)
+    assert "OSError" in message
+    assert "user:pass" not in message
+    assert "proxy.local" not in message
+
+
+@pytest.mark.asyncio
 async def test_stream_responses_via_websocket_counts_connect_and_send_against_total_timeout(monkeypatch):
     recorded: dict[str, float | None] = {}
     websocket = _WsResponse([])
@@ -6095,6 +6123,69 @@ async def test_compact_responses_does_not_infer_previous_response_id_from_sessio
     assert result.model_extra == {"output": []}
     assert captured["previous_response_id"] is None
     assert request_logs.session_lookup_calls == []
+
+
+@pytest.mark.asyncio
+async def test_compact_owner_miss_uses_api_key_scope_before_fail_closed(monkeypatch):
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_compact_scoped_owner_miss")
+    seen_account_ids: list[list[str] | None] = []
+
+    api_key = ApiKeyData(
+        id="key_compact_scope",
+        name="compact scoped",
+        key_prefix="sk-clb-scope",
+        allowed_models=None,
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+        account_assignment_scope_enabled=True,
+        assigned_account_ids=[account.id],
+    )
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service, "_resolve_websocket_previous_response_owner", AsyncMock(return_value=None))
+
+    async def fake_load_selection_inputs(**kwargs):
+        seen_account_ids.append(kwargs.get("account_ids"))
+        return SimpleNamespace(accounts=[account])
+
+    monkeypatch.setattr(service._load_balancer, "_load_selection_inputs", fake_load_selection_inputs)
+    monkeypatch.setattr(
+        service._load_balancer,
+        "select_account",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
+    )
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
+    monkeypatch.setattr(service, "_settle_compact_api_key_usage", AsyncMock())
+
+    async def fake_compact(payload, headers, access_token, account_id):
+        del payload, headers, access_token, account_id
+        return CompactResponsePayload.model_validate({"object": "response.compaction", "output": []})
+
+    monkeypatch.setattr(proxy_service, "core_compact_responses", fake_compact)
+
+    payload = ResponsesCompactRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "summarize",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+            "previous_response_id": "resp_missing_owner_scoped",
+        }
+    )
+
+    result = await service.compact_responses(payload, {"session_id": "turn_compact_scope"}, api_key=api_key)
+
+    assert result.object == "response.compaction"
+    assert result.model_extra == {"output": []}
+    assert seen_account_ids == [[account.id]]
 
 
 @pytest.mark.asyncio

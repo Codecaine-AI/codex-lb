@@ -56,7 +56,9 @@ describe("dashboard flow integration", () => {
       ),
     );
 
-    window.history.pushState({}, "", "/dashboard");
+    // Fork note: upstream's dashboard lives at /upstream-dashboard; the fork
+    // dashboard at /dashboard has its own default timeframe and tests.
+    window.history.pushState({}, "", "/upstream-dashboard");
     renderWithProviders(<App />);
 
     expect(await screen.findByRole("heading", { name: "Dashboard" })).toBeInTheDocument();
@@ -72,7 +74,7 @@ describe("dashboard flow integration", () => {
     expect(overviewTimeframes.at(-1)).toBe("7d");
 
     act(() => {
-      window.history.pushState({}, "", "/dashboard?overviewTimeframe=30d");
+      window.history.pushState({}, "", "/upstream-dashboard?overviewTimeframe=30d");
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
 

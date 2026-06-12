@@ -9,6 +9,8 @@ import { useAuthStore } from "@/features/auth/hooks/use-auth";
 import { AccountsPage } from "@/features/accounts/components/accounts-page";
 import { ApisPage } from "@/features/apis/components/apis-page";
 import { DashboardPage } from "@/features/dashboard/components/dashboard-page";
+import { ForkDashboardPage } from "@/features/fork/dashboard/components/fork-dashboard-page";
+import { ForkRequestLogsPage } from "@/features/fork/request-logs/components/fork-request-logs-page";
 import { ReportsPage } from "@/features/reports/components/reports-page";
 import { SettingsPage } from "@/features/settings/components/settings-page";
 import { useTimeFormatStore } from "@/hooks/use-time-format";
@@ -42,7 +44,9 @@ export default function App() {
         <Routes>
           <Route element={<AppLayout />}>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
-            <Route path="/dashboard" element={<DashboardPage />} />
+            <Route path="/dashboard" element={<ForkDashboardPage />} />
+            <Route path="/requests" element={<ForkRequestLogsPage />} />
+            <Route path="/upstream-dashboard" element={<DashboardPage />} />
             <Route path="/reports" element={<ReportsPage />} />
             <Route path="/accounts" element={<AccountsPage />} />
             <Route path="/apis" element={<ApisPage />} />

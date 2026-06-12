@@ -28,6 +28,7 @@ class DailyAggregateRow:
 class ModelAggregateRow:
     model: str
     cost_usd: float
+    tokens: int
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,8 @@ class ReportsRepository:
             select(
                 RequestLog.model,
                 func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("cost_usd"),
+                func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
+                func.coalesce(func.sum(RequestLog.output_tokens), 0).label("output_tokens"),
             )
             .where(and_(*conditions))
             .group_by(RequestLog.model)
@@ -132,6 +135,7 @@ class ReportsRepository:
             ModelAggregateRow(
                 model=row.model,
                 cost_usd=float(row.cost_usd),
+                tokens=int(row.input_tokens) + int(row.output_tokens),
             )
             for row in result.all()
         ]

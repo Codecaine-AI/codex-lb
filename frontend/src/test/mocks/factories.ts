@@ -43,6 +43,8 @@ import {
 	RequestLogSchema,
 	RequestLogsResponseSchema,
 } from "@/features/dashboard/schemas";
+import type { ReportsResponse } from "@/features/reports/schemas";
+import { ReportsResponseSchema } from "@/features/reports/schemas";
 import type { DashboardSettings, UpstreamProxyAdmin } from "@/features/settings/schemas";
 import { DashboardSettingsSchema, UpstreamProxyAdminSchema } from "@/features/settings/schemas";
 import type {
@@ -711,6 +713,32 @@ export function createApiKeyUsage7Day(
 		cachedInputTokens: 45_000,
 		totalRequests: 350,
 		totalCostUsd: 2.47,
+		...overrides,
+	});
+}
+
+export function createReportsResponse(
+	overrides: Partial<ReportsResponse> = {},
+): ReportsResponse {
+	return ReportsResponseSchema.parse({
+		summary: {
+			totalCostUsd: 1.82,
+			totalInputTokens: 36_000,
+			totalOutputTokens: 9_000,
+			totalCachedTokens: 8_200,
+			totalRequests: 228,
+			totalErrors: 6,
+			activeAccounts: 2,
+			avgCostPerDay: 0.26,
+			avgRequestsPerDay: 32.57,
+		},
+		daily: [],
+		byModel: [
+			{ model: "gpt-5.3-codex", costUsd: 1.2, percentage: 65.9, tokens: 30_000 },
+			{ model: "gpt-5.3", costUsd: 0.5, percentage: 27.5, tokens: 11_000 },
+			{ model: "gpt-5.2-mini", costUsd: 0.12, percentage: 6.6, tokens: 4_000 },
+		],
+		byAccount: [],
 		...overrides,
 	});
 }

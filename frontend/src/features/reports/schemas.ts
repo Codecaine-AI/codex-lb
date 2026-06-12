@@ -15,6 +15,7 @@ export const ModelCostEntrySchema = z.object({
   model: z.string(),
   costUsd: z.number(),
   percentage: z.number(),
+  tokens: z.number().optional().default(0),
 });
 
 export const AccountCostEntrySchema = z.object({

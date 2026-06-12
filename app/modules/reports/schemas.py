@@ -20,6 +20,7 @@ class ModelCostEntry(DashboardModel):
     model: str
     cost_usd: float
     percentage: float = 0.0
+    tokens: int = 0
 
 
 class AccountCostEntry(DashboardModel):

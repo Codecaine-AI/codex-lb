@@ -77,6 +77,7 @@ class ReportsService:
                     model=m.model,
                     cost_usd=round(m.cost_usd, 4),
                     percentage=round((m.cost_usd / model_total * 100), 1) if model_total > 0 else 0,
+                    tokens=m.tokens,
                 )
                 for m in by_model
             ],

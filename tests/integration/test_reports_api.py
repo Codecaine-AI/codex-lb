@@ -146,7 +146,7 @@ async def test_reports_api_includes_preserved_deleted_account_history(async_clie
             "outputTokens": 7,
         }
     ]
-    assert payload["byModel"] == [{"model": "gpt-5.1", "costUsd": 0.42, "percentage": 100.0}]
+    assert payload["byModel"] == [{"model": "gpt-5.1", "costUsd": 0.42, "percentage": 100.0, "tokens": 20}]
     assert payload["byAccount"] == [
         {
             "accountId": None,
@@ -337,7 +337,7 @@ async def test_reports_api_excludes_warmup_logs(async_client, db_setup):
     assert payload["summary"]["totalRequests"] == 1
     assert payload["summary"]["totalInputTokens"] == 6
     assert payload["summary"]["totalCostUsd"] == 0.4
-    assert payload["byModel"] == [{"model": "gpt-5.1", "costUsd": 0.4, "percentage": 100.0}]
+    assert payload["byModel"] == [{"model": "gpt-5.1", "costUsd": 0.4, "percentage": 100.0, "tokens": 10}]
     assert payload["byAccount"] == [
         {
             "accountId": "acc_reports_warmup",
@@ -418,7 +418,7 @@ async def test_reports_api_applies_account_and_model_filters(async_client, db_se
             "requests": 1,
         }
     ]
-    assert payload["byModel"] == [{"model": "gpt-5.1", "costUsd": 0.8, "percentage": 100.0}]
+    assert payload["byModel"] == [{"model": "gpt-5.1", "costUsd": 0.8, "percentage": 100.0, "tokens": 10}]
 
 
 async def test_reports_api_includes_unpriced_models_in_model_breakdown(async_client, db_setup):
@@ -462,8 +462,8 @@ async def test_reports_api_includes_unpriced_models_in_model_breakdown(async_cli
     payload = response.json()
     assert payload["summary"]["totalRequests"] == 2
     assert payload["byModel"] == [
-        {"model": "gpt-priced", "costUsd": 0.8, "percentage": 100.0},
-        {"model": "gpt-unpriced", "costUsd": 0.0, "percentage": 0.0},
+        {"model": "gpt-priced", "costUsd": 0.8, "percentage": 100.0, "tokens": 10},
+        {"model": "gpt-unpriced", "costUsd": 0.0, "percentage": 0.0, "tokens": 11},
     ]
     assert payload["byAccount"] == [
         {

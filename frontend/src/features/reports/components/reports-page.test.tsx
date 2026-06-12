@@ -79,10 +79,10 @@ describe("ReportsPage", () => {
         data: {
           ...EMPTY_REPORT,
           byModel: filters.model
-            ? [{ model: "gpt-5.1", costUsd: 1, percentage: 100 }]
+            ? [{ model: "gpt-5.1", costUsd: 1, percentage: 100, tokens: 0 }]
             : [
-                { model: "gpt-5.1", costUsd: 1, percentage: 50 },
-                { model: "gpt-5.2", costUsd: 1, percentage: 50 },
+                { model: "gpt-5.1", costUsd: 1, percentage: 50, tokens: 0 },
+                { model: "gpt-5.2", costUsd: 1, percentage: 50, tokens: 0 },
               ],
         },
         isLoading: false,
@@ -132,7 +132,7 @@ describe("ReportsPage", () => {
         ? asUseReportsResult({
             data: {
               ...EMPTY_REPORT,
-              byModel: [{ model: "gpt-5.1", costUsd: 1, percentage: 100 }],
+              byModel: [{ model: "gpt-5.1", costUsd: 1, percentage: 100, tokens: 0 }],
             },
             isLoading: false,
             isError: false,

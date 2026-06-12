@@ -12,6 +12,7 @@ const NAV_ITEMS = [
   { to: "/dashboard", label: "Dashboard" },
   { to: "/requests", label: "Requests" },
   { to: "/reports", label: "Reports" },
+  { to: "/share-lab", label: "Share" },
   { to: "/accounts", label: "Accounts" },
   { to: "/apis", label: "APIs" },
   { to: "/settings", label: "Settings" },

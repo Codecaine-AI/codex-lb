@@ -23,6 +23,7 @@ import {
   createDefaultApiKeys,
   createDefaultRequestLogs,
   createOauthCompleteResponse,
+  createReportsResponse,
   createOauthStartResponse,
   createOauthStatusResponse,
   createQuotaPlannerDecision,
@@ -414,6 +415,10 @@ export const handlers = [
 
   http.get("/api/dashboard/projections", () => {
     return HttpResponse.json(createDashboardProjections());
+  }),
+
+  http.get("/api/reports", () => {
+    return HttpResponse.json(createReportsResponse());
   }),
 
   http.get("/api/request-logs", ({ request }) => {

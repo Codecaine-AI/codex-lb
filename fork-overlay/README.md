@@ -26,12 +26,22 @@ git push
 ```
 
 For heavier conflicts, resolve once and let `git rerere` remember the fix for
-future upstream merges.
+future upstream merges. The full per-sync checklist and per-file conflict
+rules live in the [divergence ledger](divergence-ledger.md).
 
 ## Contents
 
+- [divergence-ledger.md](divergence-ledger.md): SSOT for everything this fork
+  changes relative to upstream — fork layers, modified upstream files with
+  merge rules, and the upstream sync checklist.
 - [availability-routing-design.md](availability-routing-design.md): draft design
   for an in-flight-aware, reset-priority account routing strategy.
+- [dashboard-restructure-design.md](dashboard-restructure-design.md): design for
+  the quota-first dashboard relayout (stats, aggregate gauges, accounts
+  sectioned by quota state).
+- [project-attribution-design.md](project-attribution-design.md): design for
+  request-scoped project labels and spend-per-project reporting, replacing
+  key-per-project workarounds.
 - [runtime-profile.md](runtime-profile.md): shareable runtime assumptions and
   high fan-out tuning model.
 - `personal-config.local.md`: ignored local notes with machine-specific paths,
@@ -42,6 +52,8 @@ future upstream merges.
 Use these lanes to keep the fork maintainable:
 
 - Fork overlay docs and operating notes live here in `fork-overlay/`.
+- Every fork change updates [divergence-ledger.md](divergence-ledger.md) in the
+  same commit/PR (layer entry plus any modified upstream files).
 - Behavior, API, schema, routing, dashboard, or proxy-contract changes still use
   OpenSpec under `openspec/changes/<slug>/` before implementation.
 - Stable product requirements live in `openspec/specs/**/spec.md`.

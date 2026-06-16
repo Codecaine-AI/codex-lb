@@ -11,7 +11,7 @@ import { Label } from "@/components/ui/label";
 import { useDashboard } from "@/features/dashboard/hooks/use-dashboard";
 import type { DashboardOverview } from "@/features/dashboard/schemas";
 import { useReports } from "@/features/reports/hooks/use-reports";
-import { daysAgoLocalISO, localDateISO } from "@/features/reports/date";
+import { daysAgoLocalISO, getBrowserReportsTimeZone, localDateISO } from "@/features/reports/date";
 import type { ReportsResponse } from "@/features/reports/schemas";
 import {
   buildReceiptData,
@@ -213,12 +213,15 @@ type CadenceSectionProps = {
 
 function CadenceSection({ cadence, settings }: CadenceSectionProps) {
   const overviewQuery = useDashboard(cadence.timeframe);
-  const reportsQuery = useReports({
-    startDate: daysAgoLocalISO(cadence.windowDays - 1),
-    endDate: localDateISO(),
-    accountId: [],
-    model: undefined,
-  });
+  const reportsQuery = useReports(
+    {
+      startDate: daysAgoLocalISO(cadence.windowDays - 1),
+      endDate: localDateISO(),
+      accountId: [],
+      model: undefined,
+    },
+    getBrowserReportsTimeZone(),
+  );
 
   return (
     <section

@@ -411,8 +411,15 @@ export function createDashboardAuthSession(
 		passwordRequired: true,
 		totpRequiredOnLogin: false,
 		totpConfigured: true,
+		bootstrapRequired: false,
+		bootstrapTokenConfigured: false,
 		authMode: "standard",
 		passwordManagementEnabled: true,
+		passwordSessionActive: false,
+		role: "admin",
+		permissions: ["read", "write"],
+		guestAccessEnabled: false,
+		guestPasswordRequired: false,
 		...overrides,
 	});
 }
@@ -448,6 +455,8 @@ export function createDashboardSettings(
 		limitWarmupPrompt: "Say OK.",
 		limitWarmupCooldownSeconds: 3600,
 		limitWarmupMinAvailablePercent: 100,
+		guestAccessEnabled: false,
+		guestPasswordConfigured: false,
 		...overrides,
 	});
 }
@@ -731,6 +740,14 @@ export function createReportsResponse(
 			activeAccounts: 2,
 			avgCostPerDay: 0.26,
 			avgRequestsPerDay: 32.57,
+		},
+		comparison: {
+			canCompare: false,
+			previous: {
+				totalCostUsd: 0,
+				totalTokens: 0,
+				totalRequests: 0,
+			},
 		},
 		daily: [],
 		byModel: [

@@ -10,7 +10,7 @@ from sqlalchemy import select, update
 from app.core.auth import fallback_account_id, generate_unique_account_id
 from app.core.crypto import TokenEncryptor
 from app.core.usage.refresh_scheduler import reconcile_recoverable_account_statuses
-from app.core.utils.time import utcnow
+from app.core.utils.time import naive_utc_to_epoch, utcnow
 from app.db.models import Account, AccountStatus, RequestLog
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
@@ -1035,7 +1035,7 @@ async def test_accounts_list_ignores_hidden_zero_capacity_primary_without_weekly
 
 @pytest.mark.asyncio
 async def test_accounts_list_recovers_zero_capacity_rate_limited_status(async_client, db_setup):
-    expired_reset = int((utcnow() - timedelta(minutes=5)).timestamp())
+    expired_reset = naive_utc_to_epoch(utcnow() - timedelta(minutes=5))
     account = _make_account("acc_free_recovered_primary", "free-recovered@example.com", plan_type="free")
     account.status = AccountStatus.RATE_LIMITED
     account.reset_at = expired_reset
@@ -1073,11 +1073,11 @@ async def test_accounts_list_recovers_zero_capacity_rate_limited_status(async_cl
 
 @pytest.mark.asyncio
 async def test_accounts_list_preserves_credit_backed_rate_limited_reset_guard(async_client, db_setup):
-    future_reset = int((utcnow() + timedelta(hours=2)).timestamp())
+    future_reset = naive_utc_to_epoch(utcnow() + timedelta(hours=2))
     account = _make_account("acc_credit_rate_limited", "credit-rate-limited@example.com")
     account.status = AccountStatus.RATE_LIMITED
     account.reset_at = future_reset
-    account.blocked_at = int((utcnow() - timedelta(minutes=10)).timestamp())
+    account.blocked_at = naive_utc_to_epoch(utcnow() - timedelta(minutes=10))
 
     async with SessionLocal() as session:
         accounts_repo = AccountsRepository(session)
@@ -1105,7 +1105,7 @@ async def test_accounts_list_preserves_credit_backed_rate_limited_reset_guard(as
 
 @pytest.mark.asyncio
 async def test_accounts_list_ignores_zero_capacity_monthly_primary_status(async_client, db_setup):
-    future_reset = int((utcnow() + timedelta(days=14)).timestamp())
+    future_reset = naive_utc_to_epoch(utcnow() + timedelta(days=14))
     account = _make_account("acc_free_monthly_primary", "free-monthly@example.com", plan_type="free")
     account.status = AccountStatus.RATE_LIMITED
     account.reset_at = future_reset
@@ -1145,7 +1145,7 @@ async def test_accounts_list_ignores_zero_capacity_monthly_primary_status(async_
 
 @pytest.mark.asyncio
 async def test_accounts_list_recovers_weekly_only_primary_rate_limited_status(async_client, db_setup):
-    future_reset = int((utcnow() + timedelta(days=7)).timestamp())
+    future_reset = naive_utc_to_epoch(utcnow() + timedelta(days=7))
     account = _make_account("acc_free_weekly_primary_only", "free-weekly-primary@example.com", plan_type="free")
     account.status = AccountStatus.RATE_LIMITED
     account.reset_at = future_reset
@@ -1178,7 +1178,7 @@ async def test_accounts_list_recovers_weekly_only_primary_rate_limited_status(as
 
 @pytest.mark.asyncio
 async def test_accounts_list_keeps_legacy_unknown_primary_rate_limited_until_known_window(async_client, db_setup):
-    future_reset = int((utcnow() + timedelta(days=14)).timestamp())
+    future_reset = naive_utc_to_epoch(utcnow() + timedelta(days=14))
     account = _make_account("acc_free_legacy_unknown_primary", "free-legacy@example.com", plan_type="free")
     account.status = AccountStatus.RATE_LIMITED
     account.reset_at = future_reset
@@ -1218,7 +1218,7 @@ async def test_accounts_list_keeps_legacy_unknown_primary_rate_limited_until_kno
 
 @pytest.mark.asyncio
 async def test_accounts_list_keeps_free_rate_limited_until_weekly_quota_available(async_client, db_setup):
-    future_reset = int((utcnow() + timedelta(days=14)).timestamp())
+    future_reset = naive_utc_to_epoch(utcnow() + timedelta(days=14))
     account = _make_account("acc_free_monthly_without_weekly", "free-monthly-no-weekly@example.com", plan_type="free")
     account.status = AccountStatus.RATE_LIMITED
     account.reset_at = future_reset
@@ -1254,7 +1254,7 @@ async def test_accounts_list_keeps_rate_limited_without_reset_signal(async_clien
     account = _make_account("acc_free_rate_limited_no_reset", "free-no-reset@example.com", plan_type="free")
     account.status = AccountStatus.RATE_LIMITED
     account.reset_at = None
-    account.blocked_at = int(utcnow().timestamp())
+    account.blocked_at = naive_utc_to_epoch(utcnow())
 
     async with SessionLocal() as session:
         accounts_repo = AccountsRepository(session)
@@ -1289,7 +1289,7 @@ async def test_accounts_list_keeps_rate_limited_without_reset_signal(async_clien
 
 @pytest.mark.asyncio
 async def test_accounts_list_keeps_quota_exceeded_reset_when_ignoring_monthly_primary(async_client, db_setup):
-    future_reset = int((utcnow() + timedelta(days=14)).timestamp())
+    future_reset = naive_utc_to_epoch(utcnow() + timedelta(days=14))
     account = _make_account("acc_free_quota_exceeded_monthly", "free-quota-monthly@example.com", plan_type="free")
     account.status = AccountStatus.QUOTA_EXCEEDED
     account.reset_at = future_reset
@@ -1370,8 +1370,8 @@ async def test_accounts_list_prefers_newer_weekly_primary_over_stale_secondary(a
 
 @pytest.mark.asyncio
 async def test_accounts_list_recovers_quota_exceeded_status_from_secondary_usage(async_client, db_setup):
-    expired_reset = int((utcnow() - timedelta(minutes=5)).timestamp())
-    blocked_at = int((utcnow() - timedelta(hours=2)).timestamp())
+    expired_reset = naive_utc_to_epoch(utcnow() - timedelta(minutes=5))
+    blocked_at = naive_utc_to_epoch(utcnow() - timedelta(hours=2))
     account = _make_account("acc_quota_recovered_secondary", "quota-recovered@example.com")
     account.status = AccountStatus.QUOTA_EXCEEDED
     account.reset_at = expired_reset
@@ -1386,7 +1386,7 @@ async def test_accounts_list_recovers_quota_exceeded_status_from_secondary_usage
             "acc_quota_recovered_secondary",
             42.0,
             window="secondary",
-            reset_at=int((utcnow() + timedelta(days=1)).timestamp()),
+            reset_at=naive_utc_to_epoch(utcnow() + timedelta(days=1)),
             window_minutes=10080,
         )
 

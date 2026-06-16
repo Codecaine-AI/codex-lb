@@ -10,7 +10,6 @@ import { OverviewTimeframeSelect } from "@/features/dashboard/components/filters
 import { useDashboard, useDashboardProjections } from "@/features/dashboard/hooks/use-dashboard";
 import { buildDashboardView } from "@/features/dashboard/utils";
 import {
-  OverviewTimeframeKeySchema,
   type AccountSummary,
   type OverviewTimeframe,
 } from "@/features/dashboard/schemas";
@@ -26,8 +25,7 @@ import { useThemeStore } from "@/hooks/use-theme";
 const FORK_DEFAULT_TIMEFRAME: OverviewTimeframe = "1d";
 
 function parseForkOverviewTimeframe(value: string | null): OverviewTimeframe {
-  const parsed = OverviewTimeframeKeySchema.safeParse(value);
-  return parsed.success ? parsed.data : FORK_DEFAULT_TIMEFRAME;
+  return value === "1d" || value === "7d" || value === "30d" ? value : FORK_DEFAULT_TIMEFRAME;
 }
 
 export function ForkDashboardPage() {

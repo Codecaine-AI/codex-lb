@@ -32,7 +32,8 @@ describe("AccountActions", () => {
     ).toHaveTextContent("Normal");
   });
 
-  it("renders re-authenticate action for re-auth required accounts", () => {
+  it("fires the per-account re-auth callback for re-auth required accounts", async () => {
+    const user = userEvent.setup();
     const onReauth = vi.fn();
     const account = createAccountSummary({ status: "reauth_required" });
 
@@ -61,6 +62,11 @@ describe("AccountActions", () => {
     expect(
       screen.queryByRole("combobox", { name: "Routing policy" }),
     ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Re-authenticate" }));
+
+    expect(onReauth).toHaveBeenCalledWith(account.accountId);
+    expect(onReauth).toHaveBeenCalledTimes(1);
   });
 
   it("fires the per-account probe callback for active accounts", async () => {

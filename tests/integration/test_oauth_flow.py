@@ -447,6 +447,172 @@ async def test_device_oauth_flow_heals_deactivated_account_when_import_without_o
 
 
 @pytest.mark.asyncio
+async def test_device_oauth_targeted_reauth_updates_selected_account(async_client, monkeypatch):
+    await oauth_module._OAUTH_STORE.reset()
+
+    selected_account_id = "local-selected-reauth"
+    email = "targeted-reauth@example.com"
+    raw_account_id = "acc_targeted_reauth"
+
+    encryptor = TokenEncryptor()
+    existing = Account(
+        id=selected_account_id,
+        chatgpt_account_id=raw_account_id,
+        email=email,
+        plan_type="plus",
+        routing_policy="preserve",
+        access_token_encrypted=encryptor.encrypt("old-access"),
+        refresh_token_encrypted=encryptor.encrypt("old-refresh"),
+        id_token_encrypted=encryptor.encrypt("old-id"),
+        last_refresh=utcnow(),
+        status=AccountStatus.REAUTH_REQUIRED,
+        deactivation_reason="token_invalidated",
+    )
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        await repo.upsert(existing, merge_by_email=False)
+
+    async def fake_device_code(**_):
+        return DeviceCode(
+            verification_url="https://auth.openai.com/codex/device",
+            user_code="ABCD-EFGH",
+            device_auth_id="dev_targeted_reauth",
+            interval_seconds=1,
+            expires_in_seconds=30,
+        )
+
+    async def fake_exchange_device_token(**_):
+        payload = {
+            "email": email,
+            "chatgpt_account_id": raw_account_id,
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "team"},
+        }
+        return OAuthTokens(
+            access_token="new-access-token",
+            refresh_token="new-refresh-token",
+            id_token=_encode_jwt(payload),
+        )
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(oauth_module, "request_device_code", fake_device_code)
+    monkeypatch.setattr(oauth_module, "exchange_device_token", fake_exchange_device_token)
+    monkeypatch.setattr(oauth_module, "_async_sleep", fake_sleep)
+
+    start = await async_client.post(
+        "/api/oauth/start",
+        json={"forceMethod": "device", "reauthAccountId": selected_account_id},
+    )
+    assert start.status_code == 200
+
+    await asyncio.sleep(0)
+
+    payload = None
+    for _ in range(20):
+        status = await async_client.get("/api/oauth/status", params={"flowId": start.json()["flowId"]})
+        assert status.status_code == 200
+        payload = status.json()
+        if payload["status"] == "success":
+            break
+        await asyncio.sleep(0.05)
+    assert payload and payload["status"] == "success"
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    matches = [account for account in accounts.json()["accounts"] if account["email"] == email]
+    assert len(matches) == 1
+    healed = matches[0]
+    assert healed["accountId"] == selected_account_id
+    assert healed["status"] == "active"
+    assert healed["deactivationReason"] is None
+    assert healed["planType"] == "team"
+    assert healed["routingPolicy"] == "preserve"
+
+
+@pytest.mark.asyncio
+async def test_device_oauth_targeted_reauth_rejects_wrong_identity(async_client, monkeypatch):
+    await oauth_module._OAUTH_STORE.reset()
+
+    selected_account_id = "local-selected-mismatch"
+    email = "targeted-mismatch@example.com"
+    raw_account_id = "acc_targeted_mismatch"
+
+    encryptor = TokenEncryptor()
+    existing = Account(
+        id=selected_account_id,
+        chatgpt_account_id=raw_account_id,
+        email=email,
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("old-access"),
+        refresh_token_encrypted=encryptor.encrypt("old-refresh"),
+        id_token_encrypted=encryptor.encrypt("old-id"),
+        last_refresh=utcnow(),
+        status=AccountStatus.REAUTH_REQUIRED,
+        deactivation_reason="token_invalidated",
+    )
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        await repo.upsert(existing, merge_by_email=False)
+
+    async def fake_device_code(**_):
+        return DeviceCode(
+            verification_url="https://auth.openai.com/codex/device",
+            user_code="ABCD-EFGH",
+            device_auth_id="dev_targeted_mismatch",
+            interval_seconds=1,
+            expires_in_seconds=30,
+        )
+
+    async def fake_exchange_device_token(**_):
+        payload = {
+            "email": "other-account@example.com",
+            "chatgpt_account_id": "acc_other_identity",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "team"},
+        }
+        return OAuthTokens(
+            access_token="wrong-access-token",
+            refresh_token="wrong-refresh-token",
+            id_token=_encode_jwt(payload),
+        )
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(oauth_module, "request_device_code", fake_device_code)
+    monkeypatch.setattr(oauth_module, "exchange_device_token", fake_exchange_device_token)
+    monkeypatch.setattr(oauth_module, "_async_sleep", fake_sleep)
+
+    start = await async_client.post(
+        "/api/oauth/start",
+        json={"forceMethod": "device", "reauthAccountId": selected_account_id},
+    )
+    assert start.status_code == 200
+
+    await asyncio.sleep(0)
+
+    payload = None
+    for _ in range(20):
+        status = await async_client.get("/api/oauth/status", params={"flowId": start.json()["flowId"]})
+        assert status.status_code == 200
+        payload = status.json()
+        if payload["status"] == "error":
+            break
+        await asyncio.sleep(0.05)
+    assert payload and payload["status"] == "error"
+    assert "does not match" in payload["errorMessage"]
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    selected = next(
+        account for account in accounts.json()["accounts"] if account["accountId"] == selected_account_id
+    )
+    assert selected["status"] == "reauth_required"
+    assert selected["planType"] == "plus"
+    assert all(account["email"] != "other-account@example.com" for account in accounts.json()["accounts"])
+
+
+@pytest.mark.asyncio
 async def test_oauth_persist_tokens_invalidates_routing_caches_after_identity_merge(monkeypatch):
     repo = AsyncMock()
     service = oauth_module.OauthService(repo)
@@ -844,7 +1010,7 @@ async def test_callback_server_remains_reserved_until_stop_completes():
 async def test_oauth_start_falls_back_to_device_on_os_error(async_client, monkeypatch):
     await oauth_module._OAUTH_STORE.reset()
 
-    async def fake_browser_flow(self):
+    async def fake_browser_flow(self, **_kwargs):
         raise OSError("no port")
 
     async def fake_device_code(**_):

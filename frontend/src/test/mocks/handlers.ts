@@ -49,6 +49,7 @@ const STATUS_ORDER = ["ok", "rate_limit", "quota", "error"] as const;
 
 const OauthStartPayloadSchema = z.looseObject({
   forceMethod: z.string().optional(),
+  reauthAccountId: z.string().optional(),
 });
 
 const ApiKeyCreatePayloadSchema = z.looseObject({

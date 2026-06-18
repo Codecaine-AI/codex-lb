@@ -26,6 +26,10 @@ const INITIAL_OAUTH_STATE: OAuthState = OAuthStateSchema.parse({
 
 const DEFAULT_BROWSER_OAUTH_POLL_INTERVAL_SECONDS = 2;
 
+type OAuthStartOptions = {
+  reauthAccountId?: string;
+};
+
 export function useOauth() {
   const queryClient = useQueryClient();
   const [state, setState] = useState<OAuthState>(INITIAL_OAUTH_STATE);
@@ -146,13 +150,16 @@ export function useOauth() {
     }, 1000);
   }, [clearCountdownTimer, setOauthState]);
 
-  const start = useCallback(async (forceMethod?: "browser" | "device") => {
+  const start = useCallback(async (forceMethod?: "browser" | "device", options: OAuthStartOptions = {}) => {
     clearPollTimer();
     clearCountdownTimer();
     setOauthState((prev) => ({ ...prev, status: "starting", errorMessage: null }));
 
     try {
-      const response = await startOauth({ forceMethod });
+      const response = await startOauth({
+        forceMethod,
+        ...(options.reauthAccountId ? { reauthAccountId: options.reauthAccountId } : {}),
+      });
       const method = response.method === "device" ? "device" : "browser";
       const nextState = OAuthStateSchema.parse({
         flowId: response.flowId ?? null,

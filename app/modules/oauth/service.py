@@ -39,7 +39,11 @@ from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteErr
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
 from app.db.session import get_background_session
-from app.modules.accounts.repository import AccountIdentityConflictError, AccountsRepository
+from app.modules.accounts.repository import (
+    AccountIdentityConflictError,
+    AccountReauthIdentityMismatchError,
+    AccountsRepository,
+)
 from app.modules.oauth.schemas import (
     ManualCallbackResponse,
     OauthCompleteRequest,
@@ -89,6 +93,7 @@ class OAuthState:
     finished_at: float | None = None
     callback_server: "OAuthCallbackServer | None" = None
     poll_task: asyncio.Task[None] | None = None
+    reauth_account_id: str | None = None
 
 
 class OAuthStateStore:
@@ -145,6 +150,7 @@ class OAuthStateStore:
             expires_at=flow.expires_at,
             finished_at=flow.finished_at,
             poll_task=flow.poll_task,
+            reauth_account_id=flow.reauth_account_id,
         )
 
     def set_flow_status_locked(self, flow: OAuthState, *, status: str, error_message: str | None) -> None:
@@ -280,9 +286,16 @@ class OauthService:
 
     async def start_oauth(self, request: OauthStartRequest) -> OauthStartResponse:
         force_method = (request.force_method or "").lower()
+        reauth_account_id = (request.reauth_account_id or "").strip() or None
+        if reauth_account_id is not None and await self._accounts_repo.get_by_id(reauth_account_id) is None:
+            raise OAuthError(
+                "reauth_account_not_found",
+                f"Account not found: {reauth_account_id}",
+                status_code=404,
+            )
         if not force_method:
             accounts = await self._accounts_repo.list_accounts()
-            if accounts:
+            if accounts and reauth_account_id is None:
                 server: OAuthCallbackServer | None = None
                 stop_task: asyncio.Task[None] | None = None
                 async with self._store.lock:
@@ -295,12 +308,12 @@ class OauthService:
                 return OauthStartResponse(method="browser")
 
         if force_method == "device":
-            return await self._start_device_flow()
+            return await self._start_device_flow(reauth_account_id=reauth_account_id)
 
         try:
-            return await self._start_browser_flow()
+            return await self._start_browser_flow(reauth_account_id=reauth_account_id)
         except OSError:
-            return await self._start_device_flow()
+            return await self._start_device_flow(reauth_account_id=reauth_account_id)
 
     async def oauth_status(self, flow_id: str | None = None) -> OauthStatusResponse:
         async with self._store.lock:
@@ -340,7 +353,7 @@ class OauthService:
                 return OauthCompleteResponse(status="error")
             return OauthCompleteResponse(status="pending")
 
-    async def _start_browser_flow(self) -> OauthStartResponse:
+    async def _start_browser_flow(self, *, reauth_account_id: str | None = None) -> OauthStartResponse:
         await self._wait_for_callback_server_stop()
 
         flow_id = secrets.token_urlsafe(12)
@@ -359,6 +372,7 @@ class OauthService:
                     state_token=state_token,
                     code_verifier=code_verifier,
                     expires_at=time.time() + _PENDING_BROWSER_OAUTH_FLOW_TTL_SECONDS,
+                    reauth_account_id=reauth_account_id,
                 )
             )
             if self._store._callback_server is None:
@@ -433,7 +447,7 @@ class OauthService:
                 route=route,
                 allow_direct_egress=route is None,
             )
-            await self._persist_tokens(tokens)
+            await self._persist_tokens(tokens, reauth_account_id=flow.reauth_account_id)
             await self._set_success(flow.flow_id)
             asyncio.create_task(self._stop_callback_server_if_idle())
             return ManualCallbackResponse(status="success")
@@ -443,13 +457,17 @@ class OauthService:
         except AccountIdentityConflictError:
             await self._set_error(_ACCOUNT_IDENTITY_CONFLICT_MESSAGE, flow_id=flow.flow_id)
             return ManualCallbackResponse(status="error", error_message=_ACCOUNT_IDENTITY_CONFLICT_MESSAGE)
+        except AccountReauthIdentityMismatchError as exc:
+            message = str(exc)
+            await self._set_error(message, flow_id=flow.flow_id)
+            return ManualCallbackResponse(status="error", error_message=message)
         except Exception as exc:
             logger.error("manual OAuth callback failed exception_type=%s", type(exc).__name__)
             message = "An internal error occurred."
             await self._set_error(message, flow_id=flow.flow_id)
             return ManualCallbackResponse(status="error", error_message=message)
 
-    async def _start_device_flow(self) -> OauthStartResponse:
+    async def _start_device_flow(self, *, reauth_account_id: str | None = None) -> OauthStartResponse:
         flow_id = secrets.token_urlsafe(12)
         try:
             route = await _oauth_route()
@@ -467,6 +485,7 @@ class OauthService:
                 user_code=device.user_code,
                 interval_seconds=device.interval_seconds,
                 expires_at=time.time() + device.expires_in_seconds,
+                reauth_account_id=reauth_account_id,
             )
             self._store.remove_pending_device_flows_locked()
             self._store.remember_flow_locked(flow)
@@ -508,7 +527,7 @@ class OauthService:
                 route=route,
                 allow_direct_egress=route is None,
             )
-            await self._persist_tokens(tokens)
+            await self._persist_tokens(tokens, reauth_account_id=flow.reauth_account_id)
             await self._set_success(flow.flow_id)
             html = _success_html()
         except OAuthError as exc:
@@ -517,6 +536,9 @@ class OauthService:
         except AccountIdentityConflictError:
             await self._set_error(_ACCOUNT_IDENTITY_CONFLICT_MESSAGE, flow_id=flow.flow_id)
             html = _error_html(_ACCOUNT_IDENTITY_CONFLICT_MESSAGE)
+        except AccountReauthIdentityMismatchError as exc:
+            await self._set_error(str(exc), flow_id=flow.flow_id)
+            html = _error_html(str(exc))
 
         asyncio.create_task(self._stop_callback_server_if_idle())
         return self._html_response(html)
@@ -532,7 +554,7 @@ class OauthService:
                     allow_direct_egress=route is None,
                 )
                 if tokens:
-                    await self._persist_tokens(tokens)
+                    await self._persist_tokens(tokens, reauth_account_id=context.reauth_account_id)
                     await self._set_success(flow_id)
                     return
                 await _async_sleep(context.interval_seconds)
@@ -541,6 +563,8 @@ class OauthService:
             await self._set_error(exc.message, flow_id=flow_id)
         except AccountIdentityConflictError:
             await self._set_error(_ACCOUNT_IDENTITY_CONFLICT_MESSAGE, flow_id=flow_id)
+        except AccountReauthIdentityMismatchError as exc:
+            await self._set_error(str(exc), flow_id=flow_id)
         finally:
             async with self._store.lock:
                 flow = self._store.get_flow_locked(flow_id)
@@ -561,11 +585,12 @@ class OauthService:
             user_code=state.user_code,
             interval_seconds=max(interval, 0),
             expires_at=state.expires_at,
+            reauth_account_id=state.reauth_account_id,
         )
         state.poll_task = asyncio.create_task(self._poll_device_tokens(state.flow_id, poll_context))
         return True
 
-    async def _persist_tokens(self, tokens: OAuthTokens) -> None:
+    async def _persist_tokens(self, tokens: OAuthTokens, *, reauth_account_id: str | None = None) -> None:
         claims = extract_id_token_claims(tokens.id_token)
         auth_claims = claims.auth or OpenAIAuthClaims()
         raw_account_id = auth_claims.chatgpt_account_id or claims.chatgpt_account_id
@@ -596,19 +621,33 @@ class OauthService:
         )
         if self._repo_factory:
             async with self._repo_factory() as repo:
-                await repo.upsert_account_slot(
-                    account,
-                    preserve_unknown_workspace_duplicates=False,
-                    preserve_identity_slots=True,
-                )
+                await self._persist_account(repo, account, reauth_account_id=reauth_account_id)
         else:
-            await self._accounts_repo.upsert_account_slot(
+            await self._persist_account(self._accounts_repo, account, reauth_account_id=reauth_account_id)
+
+        await self._invalidate_account_routing_caches()
+
+    async def _persist_account(
+        self,
+        repo: AccountsRepository,
+        account: Account,
+        *,
+        reauth_account_id: str | None,
+    ) -> None:
+        if reauth_account_id is None:
+            await repo.upsert_account_slot(
                 account,
                 preserve_unknown_workspace_duplicates=False,
                 preserve_identity_slots=True,
             )
-
-        await self._invalidate_account_routing_caches()
+            return
+        saved = await repo.reauthenticate_account(reauth_account_id, account)
+        if saved is None:
+            raise OAuthError(
+                "reauth_account_not_found",
+                f"Account not found: {reauth_account_id}",
+                status_code=404,
+            )
 
     async def _invalidate_account_routing_caches(self) -> None:
         get_account_selection_cache().invalidate()
@@ -694,6 +733,7 @@ class DevicePollContext:
     user_code: str
     interval_seconds: int
     expires_at: float
+    reauth_account_id: str | None = None
 
 
 def _success_html() -> str:

@@ -29,7 +29,7 @@ export type AccountDetailProps = {
   onProbe: (accountId: string) => void;
   onSetAlias: (accountId: string, alias: string | null) => Promise<unknown>;
   onDelete: (accountId: string) => void;
-  onReauth: () => void;
+  onReauth: (accountId: string) => void;
   onExportAuth: (accountId: string) => void;
   onLimitWarmupChange: (accountId: string, enabled: boolean) => void;
   onRoutingPolicyChange: (

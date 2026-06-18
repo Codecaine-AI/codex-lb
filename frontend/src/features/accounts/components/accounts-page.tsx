@@ -55,6 +55,7 @@ export function AccountsPage() {
   const deleteDialog = useDialogState<string>();
   const exportDialog = useDialogState<AccountAuthExportResponse>();
   const [deleteHistory, setDeleteHistory] = useState(false);
+  const [reauthAccountId, setReauthAccountId] = useState<string | null>(null);
 
   const accounts = useMemo(
     () => accountsQuery.data ?? [],
@@ -152,7 +153,10 @@ export function AccountsPage() {
               sortMode={accountSortMode}
               onSortModeChange={setAccountSortMode}
               onOpenImport={() => importDialog.show()}
-              onOpenOauth={() => oauthDialog.show()}
+              onOpenOauth={() => {
+                setReauthAccountId(null);
+                oauthDialog.show();
+              }}
               readOnly={!canWrite}
             />
           </div>
@@ -171,7 +175,10 @@ export function AccountsPage() {
               setAliasMutation.mutateAsync({ accountId, alias })
             }
             onDelete={(accountId) => deleteDialog.show(accountId)}
-            onReauth={() => oauthDialog.show()}
+            onReauth={(accountId) => {
+              setReauthAccountId(accountId);
+              oauthDialog.show();
+            }}
             onExportAuth={(accountId) => {
               void exportAuthMutation
                 .mutateAsync(accountId)
@@ -215,9 +222,16 @@ export function AccountsPage() {
         <OauthDialog
           open={oauthDialog.open}
           state={oauth.state}
-          onOpenChange={oauthDialog.onOpenChange}
+          onOpenChange={(open) => {
+            oauthDialog.onOpenChange(open);
+            if (!open) {
+              setReauthAccountId(null);
+            }
+          }}
           onStart={async (method) => {
-            await oauth.start(method);
+            await oauth.start(method, {
+              ...(reauthAccountId ? { reauthAccountId } : {}),
+            });
           }}
           onComplete={async () => {
             await accountsQuery.refetch();

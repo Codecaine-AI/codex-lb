@@ -79,6 +79,31 @@ describe("useOauth", () => {
     });
   });
 
+  it("passes the re-auth account id when starting OAuth for a selected account", async () => {
+    startOauthMock.mockResolvedValue({
+      flowId: "flow-reauth",
+      method: "browser",
+      authorizationUrl: "https://auth.example.com/authorize",
+      callbackUrl: "http://127.0.0.1:1455/auth/callback",
+      verificationUrl: null,
+      userCode: null,
+      deviceAuthId: null,
+      intervalSeconds: null,
+      expiresInSeconds: null,
+    });
+
+    const { result } = renderUseOauth();
+
+    await act(async () => {
+      await result.current.start("browser", { reauthAccountId: "acc-reauth" });
+    });
+
+    expect(startOauthMock).toHaveBeenCalledWith({
+      forceMethod: "browser",
+      reauthAccountId: "acc-reauth",
+    });
+  });
+
   it("does not trigger device completion for browser OAuth start", async () => {
     startOauthMock.mockResolvedValue({
       flowId: "flow-browser",

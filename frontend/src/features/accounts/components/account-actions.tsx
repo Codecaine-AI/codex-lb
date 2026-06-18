@@ -32,7 +32,7 @@ export type AccountActionsProps = {
   onResume: (accountId: string) => void;
   onProbe: (accountId: string) => void;
   onDelete: (accountId: string) => void;
-  onReauth: () => void;
+  onReauth: (accountId: string) => void;
   onExportAuth: (accountId: string) => void;
   onSecurityWorkAuthorizedChange: (accountId: string, enabled: boolean) => void;
   onLimitWarmupChange: (accountId: string, enabled: boolean) => void;
@@ -145,7 +145,7 @@ export function AccountActions({
             size="sm"
             variant="outline"
             className="h-8 gap-1.5 text-xs"
-            onClick={onReauth}
+            onClick={() => onReauth(account.accountId)}
             disabled={busy || readOnly}
           >
             <RefreshCw className="h-3.5 w-3.5" />

@@ -49,6 +49,8 @@ changes). Layers should be individually re-buildable on top of
 | `project-attribution` | designed | TBD | Request-scoped project label (`X-Project` header / API-key default) persisted on request logs, spend-per-project rollups. See [project-attribution-design.md](project-attribution-design.md). Additive backend + migration; candidate to upstream. |
 | `dashboard-restructure` | implemented | `dashboard-restructure` | Quota-first dashboard relayout: tokens/cost/requests stats, 5h+weekly gauges, accounts sectioned by quota state, projections demoted to diagnostics. See [dashboard-restructure-design.md](dashboard-restructure-design.md). Frontend-only; fork-only page + additive route swap, no owned files. |
 | `usage-share-image` | prototyping | `usage-share-image` | Shareable usage-image cards (tokens / est. API cost / requests) for daily/weekly/monthly posting. Phase 1: `/share-lab` preview route rendering the hero + receipt candidates from live data (a gauge variant was prototyped and dropped); phase 2: share dialog with PNG export. Fork-only components + additive route line + additive backend by-model token sums in `/api/reports`. |
+| `fix-targeted-oauth-reauth` | implemented | `fix-targeted-oauth-reauth` | Dashboard re-auth actions carry the selected account id through OAuth and persist refreshed credentials back into that exact account after identity validation. Additive backend + account dashboard wiring. |
+| `usage-refresh-test-clock` | landed | — (test-only) | Test-only timestamp normalization for usage/account reset fixtures so syncs do not reintroduce naive local-time epoch drift. |
 
 ## Fork-only files and directories
 
@@ -60,6 +62,7 @@ changes). Layers should be individually re-buildable on top of
 | `frontend/src/__integration__/fork-dashboard-routes.test.tsx` | `dashboard-restructure` (+ `/share-lab` case from `usage-share-image`) |
 | `openspec/changes/dashboard-restructure/**` | `dashboard-restructure` |
 | `openspec/changes/usage-share-image/**` | `usage-share-image` |
+| `openspec/changes/fix-targeted-oauth-reauth/**` | `fix-targeted-oauth-reauth` |
 
 ## Upstream files modified — additive
 
@@ -77,10 +80,27 @@ changes). Layers should be individually re-buildable on top of
 | `frontend/src/test/mocks/handlers.ts` | `usage-share-image` | `GET /api/reports` handler added. |
 | `frontend/src/test/mocks/handler-coverage.test.ts` | `usage-share-image` | `GET /api/reports` registered in the expected-endpoint list. |
 | `frontend/package.json` | `usage-share-image` | Two dependencies added: `qrcode-generator` (receipt QR code), `modern-screenshot` (oklch-safe PNG export). |
+| `frontend/bun.lock` | `usage-share-image` | Lockfile entries for `qrcode-generator` and `modern-screenshot`. |
 | `frontend/src/components/layout/app-header.tsx` | `dashboard-restructure` | One nav item added: "Requests" → `/requests`. |
 | `frontend/src/components/layout/app-header.tsx` | `usage-share-image` | One nav item added: "Share" → `/share-lab` (repoints at the phase-2 share dialog later). |
 | `frontend/src/hooks/use-dashboard-preferences.ts` | `dashboard-restructure` | New persisted `forkDiagnosticsOpen` preference (key `codex-lb-fork-diagnostics-open`) following the existing burnrate pattern. |
 | `frontend/src/__integration__/dashboard-flow.test.tsx` | `dashboard-restructure` | Upstream dashboard-flow integration test now targets `/upstream-dashboard` (URL strings only) since `/dashboard` renders the fork page with a 1d default timeframe. |
+| `frontend/src/features/reports/components/model-distribution-donut.test.tsx` | `usage-share-image` | Upstream donut test fixture includes the additive `tokens` field expected by fork report schemas. |
+| `app/modules/accounts/repository.py` | `fix-targeted-oauth-reauth` | Adds targeted `reauthenticate_account` persistence with ChatGPT/email identity mismatch protection. |
+| `app/modules/oauth/api.py` | `fix-targeted-oauth-reauth` | Preserves `OAuthError.status_code` so missing re-auth targets return 404 instead of a generic 502. |
+| `app/modules/oauth/schemas.py` | `fix-targeted-oauth-reauth` | Adds optional `reauth_account_id` to OAuth start requests. |
+| `app/modules/oauth/service.py` | `fix-targeted-oauth-reauth` | Carries the selected account id through browser, manual-callback, and device OAuth flows; targeted completions update the selected account row and clear routing-unavailable state for the saved account. |
+| `frontend/src/features/accounts/components/account-actions.tsx` | `fix-targeted-oauth-reauth` | Re-authenticate action calls back with the account id. |
+| `frontend/src/features/accounts/components/account-actions.test.tsx` | `fix-targeted-oauth-reauth` | Covers per-account re-auth callback payload. |
+| `frontend/src/features/accounts/components/account-detail.tsx` | `fix-targeted-oauth-reauth` | Threads the account-id reauth callback through the detail component. |
+| `frontend/src/features/accounts/components/accounts-page.tsx` | `fix-targeted-oauth-reauth` | Tracks selected re-auth account id and passes it to OAuth start while keeping Add Account generic. |
+| `frontend/src/features/accounts/hooks/use-oauth.ts` | `fix-targeted-oauth-reauth` | Sends optional `reauthAccountId` in OAuth start payloads. |
+| `frontend/src/features/accounts/hooks/use-oauth.test.ts` | `fix-targeted-oauth-reauth` | Covers OAuth start payloads for selected-account reauth. |
+| `frontend/src/features/accounts/schemas.ts` | `fix-targeted-oauth-reauth` | Adds optional `reauthAccountId` to the frontend OAuth start schema. |
+| `frontend/src/test/mocks/handlers.ts` | `fix-targeted-oauth-reauth` | MSW OAuth start payload schema accepts `reauthAccountId`. |
+| `tests/integration/test_oauth_flow.py` | `fix-targeted-oauth-reauth` | Backend regression coverage for targeted reauth success and identity mismatch failure. |
+| `tests/integration/test_accounts_api_extended.py` | `usage-refresh-test-clock` | Account reset fixtures use UTC epoch conversion helpers instead of local-time `timestamp()` calls. |
+| `tests/unit/test_usage_updater.py` | `usage-refresh-test-clock` | Usage freshness fixture records timestamps with the project UTC clock helper. |
 
 ## Upstream files modified — owned
 

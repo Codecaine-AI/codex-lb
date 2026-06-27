@@ -52,7 +52,7 @@ from app.modules.oauth.schemas import (
     OauthStartResponse,
     OauthStatusResponse,
 )
-from app.modules.proxy.account_cache import get_account_selection_cache
+from app.modules.proxy.account_cache import clear_account_routing_unavailable, get_account_selection_cache
 
 _async_sleep = asyncio.sleep
 logger = logging.getLogger(__name__)
@@ -621,10 +621,11 @@ class OauthService:
         )
         if self._repo_factory:
             async with self._repo_factory() as repo:
-                await self._persist_account(repo, account, reauth_account_id=reauth_account_id)
+                saved_id = await self._persist_account(repo, account, reauth_account_id=reauth_account_id)
         else:
-            await self._persist_account(self._accounts_repo, account, reauth_account_id=reauth_account_id)
+            saved_id = await self._persist_account(self._accounts_repo, account, reauth_account_id=reauth_account_id)
 
+        clear_account_routing_unavailable(saved_id)
         await self._invalidate_account_routing_caches()
 
     async def _persist_account(
@@ -633,14 +634,14 @@ class OauthService:
         account: Account,
         *,
         reauth_account_id: str | None,
-    ) -> None:
+    ) -> str:
         if reauth_account_id is None:
-            await repo.upsert_account_slot(
+            saved = await repo.upsert_account_slot(
                 account,
                 preserve_unknown_workspace_duplicates=False,
                 preserve_identity_slots=True,
             )
-            return
+            return saved.id
         saved = await repo.reauthenticate_account(reauth_account_id, account)
         if saved is None:
             raise OAuthError(
@@ -648,6 +649,7 @@ class OauthService:
                 f"Account not found: {reauth_account_id}",
                 status_code=404,
             )
+        return saved.id
 
     async def _invalidate_account_routing_caches(self) -> None:
         get_account_selection_cache().invalidate()

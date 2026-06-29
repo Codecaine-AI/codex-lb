@@ -753,9 +753,13 @@ export function createReportsResponse(
 		},
 		daily: [],
 		byModel: [
-			{ model: "gpt-5.3-codex", costUsd: 1.2, percentage: 65.9, tokens: 30_000 },
-			{ model: "gpt-5.3", costUsd: 0.5, percentage: 27.5, tokens: 11_000 },
-			{ model: "gpt-5.2-mini", costUsd: 0.12, percentage: 6.6, tokens: 4_000 },
+			{ model: "gpt-5.3-codex", costUsd: 1.2, requests: 130, percentage: 65.9, tokens: 30_000 },
+			{ model: "gpt-5.3", costUsd: 0.5, requests: 70, percentage: 27.5, tokens: 11_000 },
+			{ model: "gpt-5.2-mini", costUsd: 0.12, requests: 28, percentage: 6.6, tokens: 4_000 },
+		],
+		byUseragent: [
+			{ useragent: "codex", costUsd: 1.3, requests: 180, percentage: 71.4 },
+			{ useragent: "opencode", costUsd: 0.52, requests: 48, percentage: 28.6 },
 		],
 		byAccount: [],
 		...overrides,

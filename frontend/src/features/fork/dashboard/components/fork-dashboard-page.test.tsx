@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 import { renderWithProviders } from "@/test/utils";
 import {
@@ -7,7 +8,7 @@ import {
   createDashboardOverview,
   createDashboardProjections,
 } from "@/test/mocks/factories";
-import { useAccountMutations } from "@/features/accounts/hooks/use-accounts";
+import { useAccountMutations, useRateLimitResetCredits } from "@/features/accounts/hooks/use-accounts";
 import { useDashboard, useDashboardProjections } from "@/features/dashboard/hooks/use-dashboard";
 import type { DashboardOverview, DashboardProjections } from "@/features/dashboard/schemas";
 import { useDashboardPreferencesStore } from "@/hooks/use-dashboard-preferences";
@@ -26,6 +27,7 @@ function renderPage() {
 
 vi.mock("@/features/accounts/hooks/use-accounts", () => ({
   useAccountMutations: vi.fn(),
+  useRateLimitResetCredits: vi.fn(),
 }));
 
 vi.mock("@/features/dashboard/hooks/use-dashboard", () => ({
@@ -38,6 +40,7 @@ vi.mock("@/features/dashboard/components/filters/overview-timeframe-select", () 
 }));
 
 const useAccountMutationsMock = vi.mocked(useAccountMutations);
+const useRateLimitResetCreditsMock = vi.mocked(useRateLimitResetCredits);
 const useDashboardMock = vi.mocked(useDashboard);
 const useDashboardProjectionsMock = vi.mocked(useDashboardProjections);
 
@@ -48,6 +51,7 @@ function mockQueries(
   useAccountMutationsMock.mockReturnValue({
     resumeMutation: { mutateAsync: vi.fn() },
     limitWarmupMutation: { mutateAsync: vi.fn() },
+    resetCreditConsumeMutation: { isPending: false, mutateAsync: vi.fn().mockResolvedValue({}) },
   } as unknown as ReturnType<typeof useAccountMutations>);
   useDashboardMock.mockReturnValue({
     data: overview,
@@ -68,10 +72,18 @@ function offsetIso(minutes: number): string {
 describe("ForkDashboardPage", () => {
   beforeEach(() => {
     useAccountMutationsMock.mockReset();
+    useRateLimitResetCreditsMock.mockReset();
     useDashboardMock.mockReset();
     useDashboardProjectionsMock.mockReset();
     window.localStorage.clear();
     useDashboardPreferencesStore.setState({ forkDiagnosticsOpen: false });
+    useRateLimitResetCreditsMock.mockReturnValue({
+      data: null,
+      isPending: false,
+      isError: false,
+      isSuccess: true,
+      error: null,
+    } as ReturnType<typeof useRateLimitResetCredits>);
   });
 
   it("renders primary stats, gauges, account sections, and request logs", () => {
@@ -139,6 +151,53 @@ describe("ForkDashboardPage", () => {
     const section = screen.getByTestId("account-section-outOfRotation");
     expect(section).toHaveTextContent("reauth required");
     expect(within(section).getByRole("button", { name: /Re-auth/i })).toBeInTheDocument();
+  });
+
+  it("shows banked reset credits on compact account rows and opens the redeem dialog", async () => {
+    const user = userEvent.setup();
+    const expiresAt = offsetIso(12 * 24 * 60);
+    const overview = createDashboardOverview({
+      accounts: [
+        createAccountSummary({
+          accountId: "banked",
+          email: "banked@example.com",
+          displayName: "banked@example.com",
+          availableResetCredits: 2,
+          resetCreditNearestExpiresAt: expiresAt,
+        }),
+      ],
+    });
+    useRateLimitResetCreditsMock.mockReturnValue({
+      data: {
+        availableCount: 2,
+        nearestExpiresAt: expiresAt,
+        credits: [
+          {
+            id: "credit-soon",
+            status: "available",
+            resetType: "codex_rate_limits",
+            expiresAt,
+          },
+        ],
+      },
+      isPending: false,
+      isError: false,
+      isSuccess: true,
+      error: null,
+    } as ReturnType<typeof useRateLimitResetCredits>);
+    mockQueries(overview);
+
+    renderPage();
+
+    const resetButton = screen.getByRole("button", {
+      name: /Redeem reset credit for banked@example.com/i,
+    });
+    expect(resetButton).toHaveTextContent("2");
+
+    await user.click(resetButton);
+
+    expect(await screen.findByText("Redeem rate-limit reset credit")).toBeInTheDocument();
+    expect(screen.getByText("2 free rate limit resets")).toBeInTheDocument();
   });
 
   it("renders placeholders when summary metrics are null", () => {

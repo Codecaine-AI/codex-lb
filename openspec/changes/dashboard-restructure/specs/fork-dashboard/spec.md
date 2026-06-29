@@ -92,6 +92,27 @@ account row SHALL render without a countdown.
   future
 - **THEN** its row shows a countdown of approximately 42 minutes
 
+### Requirement: Banked reset credits are actionable from compact account rows
+The fork dashboard account rows SHALL render a compact reset-credit action
+whenever an account reports `availableResetCredits > 0`. The action SHALL show
+the available reset-credit count, SHALL include the soonest-expiring credit
+countdown when `resetCreditNearestExpiresAt` is present, and SHALL open the
+shared reset-credit confirmation flow used by the Accounts page. Read-only
+operators SHALL NOT be able to redeem reset credits from the fork dashboard.
+
+#### Scenario: Account row shows reset-credit count
+- **WHEN** an account row receives `availableResetCredits = 2`
+- **THEN** the row renders a reset-credit action showing `2`
+
+#### Scenario: Reset action opens confirmation flow
+- **WHEN** an operator activates the reset-credit action on a writable
+  dashboard session
+- **THEN** the shared reset-credit confirmation dialog opens for that account
+
+#### Scenario: No banked credits hides the action
+- **WHEN** an account reports `availableResetCredits = 0`
+- **THEN** the fork dashboard row renders no reset-credit action
+
 ### Requirement: Next revival indicator
 The fork dashboard SHALL display, adjacent to the primary window gauge, the
 soonest `resetAtPrimary` among 5-hour-dead accounts and the display name of

@@ -4,7 +4,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
 
 import { AlertMessage } from "@/components/alert-message";
+import { ResetCreditConfirmDialog } from "@/features/accounts/components/reset-credit-confirm-dialog";
 import { useAccountMutations } from "@/features/accounts/hooks/use-accounts";
+import { useAuthStore } from "@/features/auth/hooks/use-auth";
 import { DashboardSkeleton } from "@/features/dashboard/components/dashboard-skeleton";
 import { OverviewTimeframeSelect } from "@/features/dashboard/components/filters/overview-timeframe-select";
 import { useDashboard, useDashboardProjections } from "@/features/dashboard/hooks/use-dashboard";
@@ -18,6 +20,7 @@ import { DiagnosticsDisclosure } from "@/features/fork/dashboard/components/diag
 import { QuotaGauges } from "@/features/fork/dashboard/components/quota-gauges";
 import { StatColumn } from "@/features/fork/dashboard/components/stat-column";
 import { findNextRevival, sectionAccounts } from "@/features/fork/dashboard/utils";
+import { useDialogState } from "@/hooks/use-dialog-state";
 import { useThemeStore } from "@/hooks/use-theme";
 
 // Fork default: this dashboard is a live side-monitor view, so "today"
@@ -33,6 +36,7 @@ export function ForkDashboardPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const isDark = useThemeStore((s) => s.theme === "dark");
+  const canWrite = useAuthStore((state) => state.canWrite);
   const overviewTimeframe = useMemo(
     () => parseForkOverviewTimeframe(searchParams.get("overviewTimeframe")),
     [searchParams],
@@ -40,6 +44,8 @@ export function ForkDashboardPage() {
   const dashboardQuery = useDashboard(overviewTimeframe);
   const projectionsQuery = useDashboardProjections(Boolean(dashboardQuery.data));
   const { resumeMutation, limitWarmupMutation } = useAccountMutations();
+  type ResetCreditDialogTarget = { accountId: string; availableResetCredits: number };
+  const resetCreditDialog = useDialogState<ResetCreditDialogTarget>();
 
   const isRefreshing = dashboardQuery.isFetching || projectionsQuery.isFetching;
 
@@ -67,20 +73,30 @@ export function ForkDashboardPage() {
           navigate(`/accounts?selected=${account.accountId}`);
           break;
         case "resume":
-          void resumeMutation.mutateAsync(account.accountId);
+          if (canWrite) {
+            void resumeMutation.mutateAsync(account.accountId);
+          }
           break;
         case "reauth":
           navigate(`/accounts?selected=${account.accountId}`);
           break;
         case "warmup-toggle":
-          void limitWarmupMutation.mutateAsync({
+          if (canWrite) {
+            void limitWarmupMutation.mutateAsync({
+              accountId: account.accountId,
+              enabled: !account.limitWarmupEnabled,
+            });
+          }
+          break;
+        case "reset-credit":
+          resetCreditDialog.show({
             accountId: account.accountId,
-            enabled: !account.limitWarmupEnabled,
+            availableResetCredits: account.availableResetCredits ?? 0,
           });
           break;
       }
     },
-    [limitWarmupMutation, navigate, resumeMutation],
+    [canWrite, limitWarmupMutation, navigate, resetCreditDialog, resumeMutation],
   );
 
   const overview = dashboardQuery.data;
@@ -182,6 +198,7 @@ export function ForkDashboardPage() {
                   accounts={overview.accounts}
                   primaryWindowMinutes={overview.summary.primaryWindow.windowMinutes}
                   secondaryWindowMinutes={overview.summary.secondaryWindow?.windowMinutes ?? null}
+                  readOnly={!canWrite}
                   onAction={handleAccountAction}
                 />
               </section>
@@ -196,6 +213,14 @@ export function ForkDashboardPage() {
           />
         </>
       )}
+      {resetCreditDialog.data ? (
+        <ResetCreditConfirmDialog
+          open={resetCreditDialog.open}
+          accountId={resetCreditDialog.data.accountId}
+          summaryAvailableCount={resetCreditDialog.data.availableResetCredits}
+          onOpenChange={resetCreditDialog.onOpenChange}
+        />
+      ) : null}
     </div>
   );
 }

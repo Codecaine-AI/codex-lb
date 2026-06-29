@@ -29,6 +29,9 @@
       request-logs section, reusing `useDashboard`,
       `useDashboardProjections`, `useRequestLogs`, and existing filter/table
       components; keep header timeframe select + refresh.
+- [x] 2.5 Port upstream banked reset-credit affordances into fork compact
+      account rows: show the available count/countdown, open the shared
+      confirmation dialog, and respect read-only sessions.
 
 ## 3. Additive wiring (upstream touch points)
 

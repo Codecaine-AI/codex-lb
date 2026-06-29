@@ -100,8 +100,10 @@ owned ones:
   utils. The donut and account card are fork variants rather than reuse:
   the gauges are legend-free (per-account breakdown only on segment hover)
   and the cards are slim (name, quota bars, Details/Resume/Re-auth — no
-  status badge, warm-up controls, or credits line, since the section an
-  account sits in already carries its state).
+  status badge, warm-up controls, or general credits line, since the section
+  an account sits in already carries its state). Banked reset credits are
+  surfaced as a compact row action with count/countdown because redemption is
+  account-specific and expiry-sensitive.
 
 Layout (refined 2026-06-11 after first build review): left column holds the
 Tokens / Cost / Requests stat cards stacked vertically; right column holds

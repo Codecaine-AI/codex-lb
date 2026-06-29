@@ -1,4 +1,4 @@
-import { AlertTriangle, Clock, ExternalLink, KeyRound, Play } from "lucide-react";
+import { AlertTriangle, Clock, ExternalLink, KeyRound, Play, RotateCcw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { MiniQuotaBar } from "@/components/mini-quota-bar";
@@ -8,11 +8,12 @@ import type { AccountSummary } from "@/features/dashboard/schemas";
 import { outOfRotationReason, type QuotaSectionKey } from "@/features/fork/dashboard/utils";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { cn } from "@/lib/utils";
-import { formatPercentNullable, formatQuotaResetLabel } from "@/utils/formatters";
+import { formatPercentNullable, formatQuotaResetLabel, formatSingleUnitRemaining } from "@/utils/formatters";
 
 export type AccountRowProps = {
   account: AccountSummary;
   section: QuotaSectionKey;
+  readOnly?: boolean;
   onAction?: AccountCardProps["onAction"];
 };
 
@@ -50,7 +51,7 @@ function QuotaCell({
  * in the bar tooltips; dead rows surface their countdown inline because that
  * is the number that matters there.
  */
-export function AccountRow({ account, section, onAction }: AccountRowProps) {
+export function AccountRow({ account, section, readOnly = false, onAction }: AccountRowProps) {
   const blurred = usePrivacyStore((s) => s.blurred);
   const title = account.displayName || account.email || account.accountId;
   const monthlyOnly =
@@ -67,6 +68,21 @@ export function AccountRow({ account, section, onAction }: AccountRowProps) {
         : null;
   const needsResume = account.status === "paused";
   const needsReauth = account.status === "reauth_required" || account.status === "deactivated";
+  const availableResetCredits = account.availableResetCredits ?? 0;
+  const hasResetCredits = availableResetCredits > 0;
+  const resetCountdown = account.resetCreditNearestExpiresAt
+    ? formatSingleUnitRemaining(account.resetCreditNearestExpiresAt)
+    : null;
+  const resetCreditDisabled = readOnly || needsResume || needsReauth;
+  const resetButtonTitle = resetCreditDisabled
+    ? needsResume
+      ? "Resume account to redeem reset credits"
+      : needsReauth
+        ? "Re-authenticate account to redeem reset credits"
+        : "Reset credits unavailable"
+    : resetCountdown
+      ? `Reset (${availableResetCredits}) · ${resetCountdown.label}`
+      : `Reset (${availableResetCredits})`;
 
   return (
     <div
@@ -144,6 +160,32 @@ export function AccountRow({ account, section, onAction }: AccountRowProps) {
             Resume
           </Button>
         )}
+        {hasResetCredits ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            aria-label={`Redeem reset credit for ${title}`}
+            title={resetButtonTitle}
+            disabled={resetCreditDisabled}
+            className="relative h-7 gap-1 rounded-lg px-2 pr-7 text-xs text-muted-foreground hover:text-foreground"
+            onClick={() => onAction?.(account, "reset-credit")}
+          >
+            <RotateCcw className="h-3 w-3" aria-hidden="true" />
+            {availableResetCredits > 99 ? "99+" : availableResetCredits}
+            {resetCountdown ? (
+              <span
+                aria-hidden="true"
+                className={cn(
+                  "pointer-events-none absolute -top-1 right-1 text-[10px] tabular-nums",
+                  resetCountdown.expiringSoon ? "text-destructive" : "text-muted-foreground",
+                )}
+              >
+                {resetCountdown.label}
+              </span>
+            ) : null}
+          </Button>
+        ) : null}
         <Button
           type="button"
           size="sm"

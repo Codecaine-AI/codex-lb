@@ -42,9 +42,11 @@ schemas.ts`) — the change is frontend-only.
    (`quota-donut.tsx`, `fork-account-card.tsx`): gauges are legend-free with
    per-account detail on segment hover, and cards drop the status badge,
    warm-up controls, and credits line (the section an account sits in
-   already carries its state). Stats render as a vertical left column
-   (`stat-column.tsx`) ordered tokens/cost/requests, with gauges and account
-   sections in the right column.
+   already carries its state). Banked reset credits are the exception: the
+   compact row keeps a small action/countdown because upstream reset-credit
+   redemption is account-specific and time-sensitive. Stats render as a
+   vertical left column (`stat-column.tsx`) ordered tokens/cost/requests, with
+   gauges and account sections in the right column.
 4. **Diagnostics disclosure persistence** extends the existing
    `useDashboardPreferencesStore` localStorage pattern with a
    `forkDiagnosticsOpen` key (default false). Alternative — URL param — was

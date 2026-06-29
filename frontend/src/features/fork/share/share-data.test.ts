@@ -92,12 +92,12 @@ describe("buildReceiptData", () => {
   it("collapses models beyond the top four into an other bucket", () => {
     const reports = createReportsResponse({
       byModel: [
-        { model: "m1", costUsd: 1, percentage: 50, tokens: 500 },
-        { model: "m2", costUsd: 0.5, percentage: 25, tokens: 400 },
-        { model: "m3", costUsd: 0.2, percentage: 10, tokens: 300 },
-        { model: "m4", costUsd: 0.1, percentage: 8, tokens: 200 },
-        { model: "m5", costUsd: 0.1, percentage: 5, tokens: 100 },
-        { model: "m6", costUsd: 0.05, percentage: 2, tokens: 50 },
+        { model: "m1", costUsd: 1, requests: 10, percentage: 50, tokens: 500 },
+        { model: "m2", costUsd: 0.5, requests: 8, percentage: 25, tokens: 400 },
+        { model: "m3", costUsd: 0.2, requests: 6, percentage: 10, tokens: 300 },
+        { model: "m4", costUsd: 0.1, requests: 4, percentage: 8, tokens: 200 },
+        { model: "m5", costUsd: 0.1, requests: 2, percentage: 5, tokens: 100 },
+        { model: "m6", costUsd: 0.05, requests: 1, percentage: 2, tokens: 50 },
       ],
     });
     const data = buildReceiptData(reports, RECEIPT_OPTIONS);
@@ -109,16 +109,16 @@ describe("buildReceiptData", () => {
   it("estimates model tokens from cost share for old backend payloads", () => {
     const reports = createReportsResponse({
       byModel: [
-        { model: "m1", costUsd: 3, percentage: 75, tokens: 0 },
-        { model: "m2", costUsd: 1, percentage: 25, tokens: 0 },
+        { model: "m1", costUsd: 3, requests: 30, percentage: 75, tokens: 0 },
+        { model: "m2", costUsd: 1, requests: 10, percentage: 25, tokens: 0 },
       ],
     });
     const { reports: estimatedReports, estimated } = withEstimatedModelTokens(reports);
 
     expect(estimated).toBe(true);
     expect(estimatedReports.byModel).toEqual([
-      { model: "m1", costUsd: 3, percentage: 75, tokens: 33_750 },
-      { model: "m2", costUsd: 1, percentage: 25, tokens: 11_250 },
+      { model: "m1", costUsd: 3, requests: 30, percentage: 75, tokens: 33_750 },
+      { model: "m2", costUsd: 1, requests: 10, percentage: 25, tokens: 11_250 },
     ]);
   });
 
@@ -133,8 +133,8 @@ describe("buildReceiptData", () => {
   it("omits zero-token models from the breakdown", () => {
     const reports = createReportsResponse({
       byModel: [
-        { model: "m1", costUsd: 1, percentage: 100, tokens: 500 },
-        { model: "legacy-untracked", costUsd: 0, percentage: 0, tokens: 0 },
+        { model: "m1", costUsd: 1, requests: 10, percentage: 100, tokens: 500 },
+        { model: "legacy-untracked", costUsd: 0, requests: 0, percentage: 0, tokens: 0 },
       ],
     });
     const data = buildReceiptData(reports, RECEIPT_OPTIONS);

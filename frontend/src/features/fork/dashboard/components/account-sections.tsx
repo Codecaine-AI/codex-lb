@@ -15,6 +15,7 @@ export type AccountSectionsProps = {
   accounts: AccountSummary[];
   primaryWindowMinutes: number | null;
   secondaryWindowMinutes: number | null;
+  readOnly?: boolean;
   onAction?: AccountCardProps["onAction"];
 };
 
@@ -27,6 +28,7 @@ export function AccountSections({
   accounts,
   primaryWindowMinutes,
   secondaryWindowMinutes,
+  readOnly = false,
   onAction,
 }: AccountSectionsProps) {
   const sections = useMemo(() => sectionAccounts(accounts), [accounts]);
@@ -67,6 +69,7 @@ export function AccountSections({
                   key={account.accountId}
                   account={account}
                   section={descriptor.key}
+                  readOnly={readOnly}
                   onAction={onAction}
                 />
               ))}

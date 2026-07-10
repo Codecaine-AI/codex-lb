@@ -81,8 +81,10 @@ changes). Layers should be individually re-buildable on top of
 | `frontend/src/test/mocks/handler-coverage.test.ts` | `usage-share-image` | `GET /api/reports` registered in the expected-endpoint list. |
 | `frontend/package.json` | `usage-share-image` | Two dependencies added: `qrcode-generator` (receipt QR code), `modern-screenshot` (oklch-safe PNG export). |
 | `frontend/bun.lock` | `usage-share-image` | Lockfile entries for `qrcode-generator` and `modern-screenshot`. |
-| `frontend/src/components/layout/app-header.tsx` | `dashboard-restructure` | One nav item added: "Requests" → `/requests`. |
-| `frontend/src/components/layout/app-header.tsx` | `usage-share-image` | One nav item added: "Share" → `/share-lab` (repoints at the phase-2 share dialog later). |
+| `frontend/src/components/layout/app-header.tsx` | `dashboard-restructure` | One nav item added: "Requests" → `/requests` (`labelKey: "nav.requests"` since the upstream i18n nav migration). |
+| `frontend/src/components/layout/app-header.tsx` | `usage-share-image` | One nav item added: "Share" → `/share-lab` (`labelKey: "nav.share"`; repoints at the phase-2 share dialog later). |
+| `frontend/src/i18n/locales/en.json` | `dashboard-restructure`, `usage-share-image` | Two nav keys added: `nav.requests` ("Requests"), `nav.share` ("Share"). |
+| `frontend/src/i18n/locales/zh-CN.json` | `dashboard-restructure`, `usage-share-image` | Two nav keys added: `nav.requests` ("请求"), `nav.share` ("分享"). |
 | `frontend/src/hooks/use-dashboard-preferences.ts` | `dashboard-restructure` | New persisted `forkDiagnosticsOpen` preference (key `codex-lb-fork-diagnostics-open`) following the existing burnrate pattern. |
 | `frontend/src/__integration__/dashboard-flow.test.tsx` | `dashboard-restructure` | Upstream dashboard-flow integration test now targets `/upstream-dashboard` (URL strings only) since `/dashboard` renders the fork page with a 1d default timeframe. |
 | `frontend/src/features/reports/components/model-distribution-donut.test.tsx` | `usage-share-image` | Upstream donut test fixture includes the additive `tokens` field expected by fork report schemas. |

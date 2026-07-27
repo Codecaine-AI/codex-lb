@@ -7,6 +7,7 @@ import logging
 import time
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, cast
@@ -39,6 +40,7 @@ from app.modules.proxy._service.http_bridge import helpers as http_bridge_helper
 from app.modules.proxy._service.http_bridge import mixin as http_bridge_mixin_module
 from app.modules.proxy._service.http_bridge import request_submit as http_bridge_request_submit_module
 from app.modules.proxy._service.http_bridge import streaming as http_bridge_streaming_module
+from app.modules.proxy._service.http_bridge import upstream_events as http_bridge_upstream_events_module
 from app.modules.proxy.account_cache import clear_account_routing_unavailable, mark_account_routing_unavailable
 from app.modules.proxy.continuity import (
     is_http_bridge_account_neutral_replay,
@@ -2299,6 +2301,320 @@ def test_http_error_status_from_payload_accepts_official_status_code_alias() -> 
     }
 
     assert proxy_service._http_error_status_from_payload(payload) == 400
+
+
+def test_durable_tool_call_manifest_requires_complete_added_and_done_lifecycle() -> None:
+    state = proxy_service._WebSocketRequestState(
+        request_id="req-manifest",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+
+    def record(event_type: str, call_id: str) -> None:
+        http_bridge_upstream_events_module._record_http_bridge_tool_call_lifecycle(
+            state,
+            event_type=event_type,
+            payload={
+                "type": event_type,
+                "item": {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+            },
+        )
+
+    record("response.output_item.added", "call_1")
+    record("response.output_item.added", "call_2")
+    record("response.output_item.done", "call_1")
+
+    assert (
+        http_bridge_upstream_events_module._durable_pending_tool_call_manifest(
+            state,
+            {"type": "response.completed", "response": {"output": []}},
+        )
+        is None
+    )
+
+    malformed_state = proxy_service._WebSocketRequestState(
+        request_id="req-malformed-manifest",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    http_bridge_upstream_events_module._record_http_bridge_tool_call_lifecycle(
+        malformed_state,
+        event_type="response.output_item.added",
+        payload={
+            "type": "response.output_item.added",
+            "item": {"type": [], "call_id": "call_malformed"},
+        },
+    )
+    assert malformed_state.tool_call_manifest_invalid is True
+
+    missing_item_state = proxy_service._WebSocketRequestState(
+        request_id="req-missing-item-manifest",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    http_bridge_upstream_events_module._record_http_bridge_tool_call_lifecycle(
+        missing_item_state,
+        event_type="response.output_item.done",
+        payload={"type": "response.output_item.done"},
+    )
+    assert missing_item_state.tool_call_manifest_invalid is True
+    assert (
+        http_bridge_upstream_events_module._durable_pending_tool_call_manifest(
+            malformed_state,
+            {"type": "response.completed", "response": {"output": [{"type": []}]}},
+        )
+        is None
+    )
+
+    record("response.output_item.done", "call_2")
+    assert http_bridge_upstream_events_module._durable_pending_tool_call_manifest(
+        state,
+        {"type": "response.completed", "response": {"output": []}},
+    ) == {"call_1": "function_call", "call_2": "function_call"}
+
+    duplicate_state = proxy_service._WebSocketRequestState(
+        request_id="req-duplicate-manifest",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    duplicate_event: dict[str, proxy_service.JsonValue] = {
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call",
+            "call_id": "call_duplicate",
+            "name": "lookup",
+            "arguments": "{}",
+        },
+    }
+    http_bridge_upstream_events_module._record_http_bridge_tool_call_lifecycle(
+        duplicate_state,
+        event_type="response.output_item.added",
+        payload=duplicate_event,
+    )
+    http_bridge_upstream_events_module._record_http_bridge_tool_call_lifecycle(
+        duplicate_state,
+        event_type="response.output_item.added",
+        payload=duplicate_event,
+    )
+    assert duplicate_state.tool_call_manifest_invalid is True
+
+    duplicate_done_state = proxy_service._WebSocketRequestState(
+        request_id="req-duplicate-done-manifest",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    duplicate_done_event = {
+        **duplicate_event,
+        "type": "response.output_item.done",
+    }
+    for event_type, event_payload in (
+        ("response.output_item.added", duplicate_event),
+        ("response.output_item.done", duplicate_done_event),
+        ("response.output_item.done", duplicate_done_event),
+    ):
+        http_bridge_upstream_events_module._record_http_bridge_tool_call_lifecycle(
+            duplicate_done_state,
+            event_type=event_type,
+            payload=event_payload,
+        )
+    assert duplicate_done_state.tool_call_manifest_invalid is True
+
+
+def test_durable_tool_call_manifest_rejects_unobserved_terminal_call() -> None:
+    state = proxy_service._WebSocketRequestState(
+        request_id="req-terminal-manifest",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+
+    assert (
+        http_bridge_upstream_events_module._durable_pending_tool_call_manifest(
+            state,
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_unobserved",
+                            "name": "lookup",
+                            "arguments": "{}",
+                        }
+                    ]
+                },
+            },
+        )
+        is None
+    )
+
+    state.added_tool_call_types = {"call_duplicate": "function_call"}
+    state.pending_tool_call_types = {"call_duplicate": "function_call"}
+    duplicate_terminal_call: dict[str, proxy_service.JsonValue] = {
+        "type": "function_call",
+        "call_id": "call_duplicate",
+        "name": "lookup",
+        "arguments": "{}",
+    }
+    assert (
+        http_bridge_upstream_events_module._durable_pending_tool_call_manifest(
+            state,
+            {
+                "type": "response.completed",
+                "response": {"output": [duplicate_terminal_call, duplicate_terminal_call]},
+            },
+        )
+        is None
+    )
+
+
+def test_durable_tool_call_manifest_rejects_mixed_client_settled_call_types() -> None:
+    state = proxy_service._WebSocketRequestState(
+        request_id="req-mixed-client-settled-manifest",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    function_item: dict[str, proxy_service.JsonValue] = {
+        "type": "function_call",
+        "call_id": "call_function",
+        "name": "lookup",
+        "arguments": "{}",
+    }
+    for event_type in ("response.output_item.added", "response.output_item.done"):
+        http_bridge_upstream_events_module._record_http_bridge_tool_call_lifecycle(
+            state,
+            event_type=event_type,
+            payload={"type": event_type, "item": function_item},
+        )
+
+    assert (
+        http_bridge_upstream_events_module._durable_pending_tool_call_manifest(
+            state,
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [
+                        function_item,
+                        {
+                            "type": "computer_call",
+                            "call_id": "call_computer",
+                            "action": {"type": "screenshot"},
+                        },
+                    ]
+                },
+            },
+        )
+        is None
+    )
+
+    lifecycle_state = proxy_service._WebSocketRequestState(
+        request_id="req-unsupported-lifecycle-manifest",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    http_bridge_upstream_events_module._record_http_bridge_tool_call_lifecycle(
+        lifecycle_state,
+        event_type="response.output_item.added",
+        payload={
+            "type": "response.output_item.added",
+            "item": {
+                "type": "mcp_approval_request",
+                "id": "approval_1",
+            },
+        },
+    )
+    assert lifecycle_state.tool_call_manifest_invalid is True
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_malformed_tool_lifecycle_persists_unknown_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    register_previous = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "_register_http_bridge_previous_response_id", register_previous)
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", AsyncMock())
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-malformed-lifecycle",
+        response_id="resp_malformed_lifecycle",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        transport="http",
+        skip_request_log=True,
+    )
+    session = _make_bridge_session(
+        key_value="bridge-malformed-lifecycle",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    valid_item = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "lookup",
+        "arguments": "{}",
+    }
+
+    for event in (
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp_malformed_lifecycle",
+            "item": valid_item,
+        },
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp_malformed_lifecycle",
+            "item": valid_item,
+        },
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp_malformed_lifecycle",
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_malformed_lifecycle",
+                "object": "response",
+                "status": "completed",
+                "output": [],
+            },
+        },
+    ):
+        await service._process_http_bridge_upstream_text(session, json.dumps(event, separators=(",", ":")))
+
+    registration = register_previous.await_args
+    assert registration is not None
+    assert registration.kwargs["pending_tool_calls"] is None
 
 
 @pytest.mark.asyncio
@@ -6355,19 +6671,90 @@ async def test_stream_via_http_bridge_does_not_inject_durable_previous_response_
 
 
 @pytest.mark.asyncio
-async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_resend(
+@pytest.mark.parametrize(
+    ("suffix_items", "pending_tool_calls", "preserves_full_resend", "forwardable_owner"),
+    [
+        pytest.param(
+            [
+                {"role": "assistant", "content": "hello back"},
+                {"role": "user", "content": "follow up"},
+            ],
+            None,
+            True,
+            False,
+            id="retained-assistant-output",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "result",
+                },
+            ],
+            {"call-1": "function_call"},
+            True,
+            False,
+            id="self-contained-tool-loop",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "result",
+                },
+            ],
+            None,
+            False,
+            False,
+            id="tool-loop-with-unknown-manifest",
+        ),
+        pytest.param(
+            [{"role": "user", "content": "revise that answer"}],
+            None,
+            False,
+            False,
+            id="missing-prior-output",
+        ),
+        pytest.param(
+            [{"role": "user", "content": "revise that answer"}],
+            None,
+            False,
+            True,
+            id="owner-forward-race-missing-prior-output",
+        ),
+    ],
+)
+async def test_stream_via_http_bridge_preserves_only_safe_trimmable_full_resend_on_fresh_bridge(
     monkeypatch: pytest.MonkeyPatch,
+    suffix_items: list[proxy_service.JsonValue],
+    pending_tool_calls: dict[str, str] | None,
+    preserves_full_resend: bool,
+    forwardable_owner: bool,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
-    input_items = [
+    stored_input_items: list[proxy_service.JsonValue] = [
         {
             "type": "additional_tools",
             "role": "developer",
             "tools": [{"type": "custom", "name": "shell"}],
         },
         {"role": "user", "content": "hello"},
-        {"role": "user", "content": "follow up"},
     ]
+    input_items = [*stored_input_items, *suffix_items]
     payload = proxy_service.ResponsesRequest.model_validate(
         {
             "model": "gpt-5.4",
@@ -6422,6 +6809,7 @@ async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_
             **kwargs,
         )
         prepared_frames.append(json.loads(text_data))
+        request_state.previous_response_id = prepared_payload.previous_response_id
         return request_state, text_data
 
     session = proxy_service._HTTPBridgeSession(
@@ -6471,19 +6859,23 @@ async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_
                 canonical_key="sid-123",
                 api_key_scope="__anonymous__",
                 account_id="acc-1",
-                owner_instance_id="instance-a",
+                owner_instance_id="instance-b" if forwardable_owner else "instance-a",
                 owner_epoch=1,
-                lease_expires_at=datetime.now(timezone.utc),
+                lease_expires_at=(
+                    datetime.now(timezone.utc) + timedelta(seconds=60)
+                    if forwardable_owner
+                    else datetime.now(timezone.utc)
+                ),
                 state=HttpBridgeSessionState.ACTIVE,
                 latest_turn_state="http_turn_1",
                 latest_response_id="resp_latest",
-                latest_input_item_count=2,
-                latest_input_full_fingerprint=proxy_service._fingerprint_input_items(
-                    cast(list[Any], payload.input)[:2]
-                ),
+                latest_input_item_count=len(stored_input_items),
+                latest_input_full_fingerprint=proxy_service._fingerprint_input_items(stored_input_items),
+                latest_pending_tool_calls=pending_tool_calls,
             )
         ),
     )
+    session.codex_session = True
     account_neutral_classifier = Mock(return_value=True)
     monkeypatch.setattr(
         http_bridge_streaming_module,
@@ -6491,7 +6883,14 @@ async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_
         account_neutral_classifier,
     )
     monkeypatch.setattr(service, "_prepare_http_bridge_request", fake_prepare)
-    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", AsyncMock(return_value=session))
+    monkeypatch.setattr(
+        service,
+        "_http_bridge_can_forward_to_active_owner",
+        AsyncMock(return_value=forwardable_owner),
+    )
+    monkeypatch.setattr(service, "_resolve_websocket_previous_response_owner", AsyncMock(return_value="acc-1"))
+    get_or_create = AsyncMock(return_value=session)
+    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", get_or_create)
     monkeypatch.setattr(service, "_submit_http_bridge_request", AsyncMock())
     monkeypatch.setattr(service, "_detach_http_bridge_request", AsyncMock())
 
@@ -6514,15 +6913,19 @@ async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_
     ]
 
     assert chunks == []
-    assert prepared_previous_response_ids == [None, "resp_latest", "resp_latest"]
-    assert prepared_input_lengths == [3, 3, 1]
+    assert prepared_previous_response_ids == ([None] if preserves_full_resend else [None, "resp_latest", "resp_latest"])
+    assert prepared_input_lengths == (
+        [len(input_items)] if preserves_full_resend else [len(input_items), len(input_items), len(suffix_items)]
+    )
     assert all("tools" not in frame for frame in prepared_frames)
-    assert prepared_frames[-1]["input"] == [input_items[-1]]
+    normalized_input_items = cast(list[proxy_service.JsonValue], payload.input)
+    expected_input_items = (
+        normalized_input_items if preserves_full_resend else normalized_input_items[-len(suffix_items) :]
+    )
+    assert prepared_frames[-1]["input"] == expected_input_items
     assert [frame["client_metadata"][CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY] for frame in prepared_frames] == [
         "true",
-        "true",
-        "true",
-    ]
+    ] * len(prepared_frames)
     assert all(
         frame["reasoning"]
         == {
@@ -6534,6 +6937,16 @@ async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_
         for frame in prepared_frames
     )
     assert cast(dict[str, Any], payload.to_payload()["reasoning"])["context"] == "last_turn"
+    creation = get_or_create.await_args
+    assert creation is not None
+    assert creation.kwargs["previous_response_id"] == (
+        None if preserves_full_resend or forwardable_owner else "resp_latest"
+    )
+    assert creation.kwargs["preferred_account_id"] == "acc-1"
+    assert session.last_completed_response_id == (None if preserves_full_resend else "resp_latest")
+    if not preserves_full_resend:
+        assert request_state.proxy_injected_previous_response_id is True
+        assert request_state.fresh_upstream_request_is_retry_safe is False
     account_neutral_classifier.assert_not_called()
 
 
@@ -7713,10 +8126,27 @@ async def test_stream_via_http_bridge_proves_fallback_owner_key_before_legacy_fo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("forward_to_active_owner", [False, True], ids=["local_create", "owner_forward"])
-async def test_stream_via_http_bridge_clears_injected_anchor_after_owner_unavailable_fresh_resend(
+@pytest.mark.parametrize(
+    (
+        "forward_to_active_owner",
+        "retains_prior_output",
+        "takeover_context_matches",
+        "takeover_account_id",
+    ),
+    [
+        pytest.param(False, True, True, "acc-1", id="local-create-safe-resend"),
+        pytest.param(True, True, True, "acc-1", id="owner-forward-safe-resend"),
+        pytest.param(True, False, True, "acc-1", id="owner-forward-unsafe-resend"),
+        pytest.param(True, False, True, "acc-2", id="owner-forward-refreshed-account"),
+        pytest.param(True, False, False, "acc-1", id="owner-forward-refreshed-prefix-mismatch"),
+    ],
+)
+async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     forward_to_active_owner: bool,
+    retains_prior_output: bool,
+    takeover_context_matches: bool,
+    takeover_account_id: str,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     prefix_items = [{"role": "user", "content": "one"}]
@@ -7725,13 +8155,17 @@ async def test_stream_via_http_bridge_clears_injected_anchor_after_owner_unavail
         "role": "assistant",
         "content": [{"type": "output_text", "text": "two"}],
     }
-    input_items = [*prefix_items, retained_output, {"role": "user", "content": "three"}]
+    input_items = [*prefix_items]
+    if retains_prior_output:
+        input_items.append(retained_output)
+    input_items.append({"role": "user", "content": "three"})
     payload = proxy_service.ResponsesRequest.model_validate(
         {"model": "gpt-5.4", "instructions": "hi", "input": input_items},
     )
     payload_prefix_items = cast(list[proxy_service.JsonValue], payload.input)[: len(prefix_items)]
     request_states: list[proxy_service._WebSocketRequestState] = []
     prepared_previous_response_ids: list[str | None] = []
+    prepared_inputs: list[proxy_service.JsonValue] = []
 
     def fake_prepare(
         prepared_payload: proxy_service.ResponsesRequest,
@@ -7744,6 +8178,7 @@ async def test_stream_via_http_bridge_clears_injected_anchor_after_owner_unavail
     ) -> tuple[proxy_service._WebSocketRequestState, str]:
         del api_key, api_key_reservation, request_id, client_ip
         prepared_previous_response_ids.append(prepared_payload.previous_response_id)
+        prepared_inputs.append(prepared_payload.input)
         state = proxy_service._WebSocketRequestState(
             request_id=f"req-{len(request_states)}",
             model="gpt-5.4",
@@ -7762,12 +8197,13 @@ async def test_stream_via_http_bridge_clears_injected_anchor_after_owner_unavail
             client_metadata=None,
         )
 
+    owner_error_code = "previous_response_owner_unavailable" if retains_prior_output else "bridge_owner_unreachable"
     owner_unavailable = proxy_service.ProxyResponseError(
         502,
         {
             "error": {
                 "type": "server_error",
-                "code": "previous_response_owner_unavailable",
+                "code": owner_error_code,
                 "message": "Previous response owner account is unavailable; retry later.",
             }
         },
@@ -7828,25 +8264,38 @@ async def test_stream_via_http_bridge_clears_injected_anchor_after_owner_unavail
             http_responses_session_bridge_instance_id="instance-a",
         ),
     )
+    durable_lookup = proxy_service.DurableBridgeLookup(
+        session_id="sess-fresh-owner-unavailable",
+        canonical_kind="turn_state_header",
+        canonical_key="http_turn_fresh",
+        api_key_scope="__anonymous__",
+        account_id="acc-1",
+        owner_instance_id="instance-b",
+        owner_epoch=1,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+        state=HttpBridgeSessionState.ACTIVE,
+        latest_turn_state="http_turn_fresh",
+        latest_response_id="resp_latest",
+        latest_input_item_count=len(prefix_items),
+        latest_input_full_fingerprint=proxy_service._fingerprint_input_items(payload_prefix_items),
+    )
+    takeover_lookup = replace(
+        durable_lookup,
+        account_id=takeover_account_id,
+        owner_instance_id=None,
+        lease_expires_at=None,
+        latest_input_full_fingerprint=(
+            durable_lookup.latest_input_full_fingerprint if takeover_context_matches else "f" * 64
+        ),
+    )
     monkeypatch.setattr(
         service._durable_bridge,
         "lookup_request_targets",
         AsyncMock(
-            return_value=proxy_service.DurableBridgeLookup(
-                session_id="sess-fresh-owner-unavailable",
-                canonical_kind="turn_state_header",
-                canonical_key="http_turn_fresh",
-                api_key_scope="__anonymous__",
-                account_id="acc-1",
-                owner_instance_id="instance-b",
-                owner_epoch=1,
-                lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
-                state=HttpBridgeSessionState.ACTIVE,
-                latest_turn_state="http_turn_fresh",
-                latest_response_id="resp_latest",
-                latest_input_item_count=len(prefix_items),
-                latest_input_full_fingerprint=proxy_service._fingerprint_input_items(payload_prefix_items),
-            )
+            side_effect=[durable_lookup, takeover_lookup]
+            if forward_to_active_owner and not retains_prior_output
+            else None,
+            return_value=durable_lookup,
         ),
     )
     monkeypatch.setattr(service, "_http_bridge_has_live_local_session", AsyncMock(return_value=False))
@@ -7861,39 +8310,69 @@ async def test_stream_via_http_bridge_clears_injected_anchor_after_owner_unavail
     monkeypatch.setattr(service, "_forward_http_bridge_request_to_owner", fake_forward_http_bridge_request_to_owner)
     monkeypatch.setattr(service, "_stream_http_bridge_session_events", fake_stream_http_bridge_session_events)
 
-    chunks = [
-        chunk
-        async for chunk in service._stream_via_http_bridge(
-            payload,
-            headers={
-                "x-codex-session-id": "session-shared-with-retired-owner",
-                "x-codex-turn-state": "http_turn_fresh",
-            },
-            codex_session_affinity=True,
-            propagate_http_errors=False,
-            openai_cache_affinity=False,
-            api_key=None,
-            api_key_reservation=None,
-            suppress_text_done_events=False,
-            idle_ttl_seconds=120.0,
-            codex_idle_ttl_seconds=1800.0,
-            max_sessions=8,
-            queue_limit=4,
-        )
-    ]
+    async def collect_chunks() -> list[str]:
+        return [
+            chunk
+            async for chunk in service._stream_via_http_bridge(
+                payload,
+                headers={
+                    "x-codex-session-id": "session-shared-with-retired-owner",
+                    "x-codex-turn-state": "http_turn_fresh",
+                },
+                codex_session_affinity=True,
+                propagate_http_errors=False,
+                openai_cache_affinity=False,
+                api_key=None,
+                api_key_reservation=None,
+                suppress_text_done_events=False,
+                idle_ttl_seconds=120.0,
+                codex_idle_ttl_seconds=1800.0,
+                max_sessions=8,
+                queue_limit=4,
+            )
+        ]
+
+    if not takeover_context_matches:
+        with pytest.raises(ProxyResponseError) as exc_info:
+            await collect_chunks()
+        assert exc_info.value.payload["error"]["code"] == "bridge_owner_unreachable"
+        assert get_or_create_calls == 1
+        return
+
+    chunks = await collect_chunks()
 
     assert chunks == []
-    if forward_to_active_owner:
+    if forward_to_active_owner and retains_prior_output:
         assert prepared_previous_response_ids == [None, None, None]
         assert forwarded_payloads == [payload]
+    elif forward_to_active_owner:
+        assert prepared_previous_response_ids == [None, "resp_latest"]
+        assert forwarded_payloads == [payload]
+        normalized_input = cast(list[proxy_service.JsonValue], payload.input)
+        assert prepared_inputs[-1] == normalized_input[len(prefix_items) :]
     else:
-        assert prepared_previous_response_ids[-2:] == ["resp_latest", None]
+        assert prepared_previous_response_ids == [None, None]
         assert forwarded_payloads == []
     assert get_or_create_kwargs[-1]["allow_forward_to_owner"] is False
-    assert get_or_create_kwargs[-1]["exclude_account_ids"] == {"acc-1"}
-    assert get_or_create_kwargs[-1]["headers"] == {}
-    assert request_states[-1].previous_response_id is None
-    assert request_states[-1].proxy_injected_previous_response_id is False
+    assert get_or_create_kwargs[-1]["exclude_account_ids"] == ({"acc-1"} if retains_prior_output else None)
+    assert get_or_create_kwargs[-1]["preferred_account_id"] == (None if retains_prior_output else takeover_account_id)
+    assert get_or_create_kwargs[-1]["headers"] == (
+        {}
+        if retains_prior_output
+        else {
+            "x-codex-session-id": "session-shared-with-retired-owner",
+            "x-codex-turn-state": "http_turn_fresh",
+        }
+    )
+    assert request_states[-1].previous_response_id == (
+        "resp_latest" if forward_to_active_owner and not retains_prior_output else None
+    )
+    assert request_states[-1].proxy_injected_previous_response_id is (
+        forward_to_active_owner and not retains_prior_output
+    )
+    if forward_to_active_owner and not retains_prior_output:
+        assert request_states[-1].fresh_upstream_request_is_retry_safe is False
+        assert request_states[-1].input_item_count == len(input_items)
 
 
 @pytest.mark.asyncio
@@ -16733,7 +17212,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
     first_call = get_or_create.await_args_list[0]
     second_call = get_or_create.await_args_list[1]
     third_call = get_or_create.await_args_list[2]
-    assert first_call.kwargs["previous_response_id"] == ("resp_completed_anchor" if stored_model is None else None)
+    assert first_call.kwargs["previous_response_id"] is None
     assert first_call.kwargs["preferred_account_id"] == "acc-owner"
     assert first_call.kwargs["allow_forward_to_owner"] is True
     assert second_call.kwargs["previous_response_id"] is None

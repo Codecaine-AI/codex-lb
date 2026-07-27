@@ -371,6 +371,10 @@ class _FakeBridgeUpstreamWebSocket:
 class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     """First response completes with an unresolved ``custom_tool_call``."""
 
+    def __init__(self, response_id_prefix: str = "resp_bridge", *, emit_added: bool = False) -> None:
+        super().__init__(response_id_prefix)
+        self._emit_added = emit_added
+
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
         response_id = f"resp_bridge_custom_{len(self.sent_text)}"
@@ -387,6 +391,28 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
             )
         )
         if len(self.sent_text) == 1:
+            if self._emit_added:
+                await self._messages.put(
+                    _FakeUpstreamMessage(
+                        "text",
+                        text=json.dumps(
+                            {
+                                "type": "response.output_item.added",
+                                "response_id": response_id,
+                                "item": {
+                                    "id": "ctc_shell",
+                                    "type": "custom_tool_call",
+                                    "status": "in_progress",
+                                    "call_id": "call_custom_shell",
+                                    "name": "shell",
+                                    "input": "",
+                                },
+                                "output_index": 0,
+                            },
+                            separators=(",", ":"),
+                        ),
+                    )
+                )
             await self._messages.put(
                 _FakeUpstreamMessage(
                     "text",
@@ -438,6 +464,15 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
                 ),
             )
         )
+
+
+class _ClosingInterruptedCustomToolUpstreamWebSocket(_InterruptedCustomToolUpstreamWebSocket):
+    def __init__(self, response_id_prefix: str = "resp_bridge") -> None:
+        super().__init__(response_id_prefix, emit_added=True)
+
+    async def send_text(self, text: str) -> None:
+        await super().send_text(text)
+        await self._messages.put(_FakeUpstreamMessage("close", close_code=1000))
 
 
 class _ClosingBridgeUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
@@ -7079,6 +7114,104 @@ async def test_v1_responses_http_bridge_opens_fresh_session_for_previous_respons
     assert second.status_code == 200
     assert second.json()["output"][0]["content"][0]["text"] == "OK"
     assert connect_count == 2
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_preserves_full_resend_before_fresh_bridge_send(async_client, monkeypatch):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_preserve_fresh_reattach",
+        "http-bridge-preserve-fresh-reattach@example.com",
+    )
+    account = await _get_account(account_id)
+    first_upstream = _ClosingInterruptedCustomToolUpstreamWebSocket("resp_preserve_source")
+    replay_upstream = _FakeBridgeUpstreamWebSocket("resp_preserve_replay")
+    upstreams = [first_upstream, replay_upstream]
+    connect_headers: list[dict[str, str]] = []
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline, kwargs
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del access_token, account_id_header, base_url, session
+        connect_headers.append(dict(headers))
+        return upstreams[len(connect_headers) - 1]
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    session_headers = {"x-codex-session-id": "fresh-reattach-full-resend"}
+    historical_input = [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first question"}],
+        }
+    ]
+    first = await asyncio.wait_for(
+        async_client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": historical_input,
+            },
+            headers=session_headers,
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+    assert first.status_code == 200, first.text
+
+    full_resend = [
+        *historical_input,
+        {
+            "type": "custom_tool_call",
+            "call_id": "call_custom_shell",
+            "name": "shell",
+            "input": "pwd",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_custom_shell",
+            "output": "/workspace",
+        },
+    ]
+    second = await asyncio.wait_for(
+        async_client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": full_resend,
+            },
+            headers=session_headers,
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+
+    assert second.status_code == 200, second.text
+    assert second.json()["id"] == "resp_preserve_replay_1"
+    assert len(connect_headers) == 2
+    replay_connect_headers = {key.lower(): value for key, value in connect_headers[1].items()}
+    assert replay_connect_headers["x-codex-session-id"] == session_headers["x-codex-session-id"]
+    assert len(first_upstream.sent_text) == 1
+    assert len(replay_upstream.sent_text) == 1
+    replay_payload = json.loads(replay_upstream.sent_text[0])
+    assert "previous_response_id" not in replay_payload
+    assert replay_payload["input"] == full_resend
 
 
 @pytest.mark.asyncio

@@ -1,19 +1,29 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 
 import { AlertMessage } from "@/components/alert-message";
 import { Button } from "@/components/ui/button";
 import { listAccounts } from "@/features/accounts/api";
 import { useReports } from "@/features/reports/hooks/use-reports";
+import { useReportChartVisibility } from "@/features/reports/hooks/use-report-chart-visibility";
 import { getErrorMessageOrNull } from "@/utils/errors";
 import { ReportsFilters, type ReportsFiltersState } from "./reports-filters";
 import { ReportsSummaryCards } from "./reports-summary-cards";
 import type { CostPerDayChartProps } from "./cost-per-day-chart";
 import type { TokensPerDayChartProps } from "./tokens-per-day-chart";
+import type { TimeToFirstTokenChartProps } from "./time-to-first-token-chart";
+import type { TokensPerSecondChartProps } from "./tokens-per-second-chart";
+import type { QueueWaitChartProps } from "./queue-wait-chart";
 import type { ModelDistributionDonutProps } from "./model-distribution-donut";
 import type { UseragentDistributionDonutProps } from "./useragent-distribution-donut";
 import { DailyDetailTable } from "./daily-detail-table";
-import { daysAgoLocalISO, getBrowserReportsTimeZone, localDateISO } from "../date";
+import {
+  daysAgoLocalISO,
+  getBrowserReportsTimeZone,
+  isReportDateRangeValid,
+  localDateISO,
+} from "../date";
 
 const CostPerDayChart = lazy(() =>
   import("./cost-per-day-chart").then((module) => ({
@@ -23,6 +33,21 @@ const CostPerDayChart = lazy(() =>
 const TokensPerDayChart = lazy(() =>
   import("./tokens-per-day-chart").then((module) => ({
     default: (props: TokensPerDayChartProps) => <module.TokensPerDayChart {...props} />,
+  })),
+);
+const TimeToFirstTokenChart = lazy(() =>
+  import("./time-to-first-token-chart").then((module) => ({
+    default: (props: TimeToFirstTokenChartProps) => <module.TimeToFirstTokenChart {...props} />,
+  })),
+);
+const TokensPerSecondChart = lazy(() =>
+  import("./tokens-per-second-chart").then((module) => ({
+    default: (props: TokensPerSecondChartProps) => <module.TokensPerSecondChart {...props} />,
+  })),
+);
+const QueueWaitChart = lazy(() =>
+  import("./queue-wait-chart").then((module) => ({
+    default: (props: QueueWaitChartProps) => <module.QueueWaitChart {...props} />,
   })),
 );
 const ModelDistributionDonut = lazy(() =>
@@ -54,6 +79,7 @@ export type ReportsPageProps = {
 };
 
 export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
+  const { t } = useTranslation();
   const [filters, setFilters] = useState<ReportsFiltersState>(() => ({
     ...createDefaultFilters(),
     ...initialFilters,
@@ -64,6 +90,7 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
   const [reportsTimeZone, setReportsTimeZone] = useState<string | undefined>(() =>
     getBrowserReportsTimeZone(),
   );
+  const { visibleChartIds, setVisibleChartIds } = useReportChartVisibility();
 
   useEffect(() => {
     const refreshReportsTimeZone = () => {
@@ -144,6 +171,11 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
   );
 
   const handleRetry = async () => {
+    if (!isReportDateRangeValid(filters.startDate, filters.endDate)) {
+      await refetchAccounts();
+      return;
+    }
+
     await Promise.allSettled([
       reportsQuery.refetch(),
       filterCatalogQuery.refetch(),
@@ -174,10 +206,10 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
     <div className="mx-auto w-full max-w-[1500px] flex-1 space-y-6 px-4 py-8 sm:px-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight text-foreground">
-          Cost Report
+          {t("reports.page.title")}
         </h1>
         <p className="text-sm text-muted-foreground">
-          Usage history by date range
+          {t("reports.page.subtitle")}
         </p>
       </div>
 
@@ -187,29 +219,31 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
         accountOptions={accountOptions}
         modelOptions={modelOptions}
         useragentOptions={useragentOptions}
+        visibleChartIds={visibleChartIds}
         onPresetSelect={handlePresetSelect}
         onFiltersChange={handleFiltersChange}
+        onVisibleChartIdsChange={setVisibleChartIds}
       />
 
       {mainReportsError ? (
         <AlertMessage variant="error">
-          Failed to load report data: {mainReportsError}
+          {t("reports.errors.data", { error: mainReportsError })}
         </AlertMessage>
       ) : null}
       {sharedOptionsError ? (
         <AlertMessage variant="error">
-          Failed to load model and user-agent options: {sharedOptionsError}
+          {t("reports.errors.options", { error: sharedOptionsError })}
         </AlertMessage>
       ) : null}
       {accountOptionsError ? (
         <AlertMessage variant="error">
-          Failed to load account options: {accountOptionsError}
+          {t("reports.errors.accounts", { error: accountOptionsError })}
         </AlertMessage>
       ) : null}
 
       {reportsQuery.isLoading ? (
         <div className="flex items-center justify-center py-20 text-sm text-muted-foreground">
-          Loading...
+          {t("common.loading")}
         </div>
       ) : reportsQuery.data ? (
         <>
@@ -217,22 +251,55 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
             summary={reportsQuery.data.summary}
             comparison={reportsQuery.data.comparison}
           />
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-            <Suspense fallback={<div className="h-[270px] rounded-xl border bg-card" />}>
-              <CostPerDayChart
-                startDate={filters.startDate}
-                endDate={filters.endDate}
-                data={reportsQuery.data.daily}
-              />
-            </Suspense>
-            <Suspense fallback={<div className="h-[270px] rounded-xl border bg-card" />}>
-              <TokensPerDayChart
-                startDate={filters.startDate}
-                endDate={filters.endDate}
-                data={reportsQuery.data.daily}
-              />
-            </Suspense>
-          </div>
+          {visibleChartIds.length > 0 ? (
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              {visibleChartIds.includes("costByDay") ? (
+                <Suspense fallback={<div className="h-[270px] rounded-xl border bg-card" />}>
+                  <CostPerDayChart
+                    startDate={filters.startDate}
+                    endDate={filters.endDate}
+                    data={reportsQuery.data.daily}
+                  />
+                </Suspense>
+              ) : null}
+              {visibleChartIds.includes("tokensByDay") ? (
+                <Suspense fallback={<div className="h-[270px] rounded-xl border bg-card" />}>
+                  <TokensPerDayChart
+                    startDate={filters.startDate}
+                    endDate={filters.endDate}
+                    data={reportsQuery.data.daily}
+                  />
+                </Suspense>
+              ) : null}
+              {visibleChartIds.includes("timeToFirstToken") ? (
+                <Suspense fallback={<div className="h-[270px] rounded-xl border bg-card" />}>
+                  <TimeToFirstTokenChart
+                    startDate={filters.startDate}
+                    endDate={filters.endDate}
+                    data={reportsQuery.data.daily}
+                  />
+                </Suspense>
+              ) : null}
+              {visibleChartIds.includes("tokensPerSecond") ? (
+                <Suspense fallback={<div className="h-[270px] rounded-xl border bg-card" />}>
+                  <TokensPerSecondChart
+                    startDate={filters.startDate}
+                    endDate={filters.endDate}
+                    data={reportsQuery.data.daily}
+                  />
+                </Suspense>
+              ) : null}
+              {visibleChartIds.includes("queueWait") ? (
+                <Suspense fallback={<div className="h-[270px] rounded-xl border bg-card" />}>
+                  <QueueWaitChart
+                    startDate={filters.startDate}
+                    endDate={filters.endDate}
+                    data={reportsQuery.data.daily}
+                  />
+                </Suspense>
+              ) : null}
+            </div>
+          ) : null}
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
             <div className="space-y-4 lg:col-span-1">
               <Suspense fallback={<div className="h-[220px] rounded-xl border bg-card" />}>
@@ -254,7 +321,7 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
       ) : hasAnyError ? (
         <div className="space-y-3 rounded-xl border bg-card p-4">
           <AlertMessage variant="warning">
-            Some report data could not be loaded. Try reloading.
+            {t("reports.errors.partial")}
           </AlertMessage>
           <Button
             type="button"
@@ -264,7 +331,7 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
               void handleRetry();
             }}
           >
-            Retry
+            {t("common.actions.retry")}
           </Button>
         </div>
       ) : null}

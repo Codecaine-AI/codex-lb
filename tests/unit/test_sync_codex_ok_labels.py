@@ -31,6 +31,9 @@ def decision(module: ModuleType, **overrides: Any) -> Any:
         "has_needs_work_label": False,
         "wants_needs_work_label": False,
         "needs_work_action": "keep",
+        "has_needs_rebase_label": False,
+        "wants_needs_rebase_label": False,
+        "needs_rebase_action": "keep",
         "legacy_labels": frozenset(),
         "reason": "checks are pending",
         "review_url": None,
@@ -42,6 +45,85 @@ def decision(module: ModuleType, **overrides: Any) -> Any:
     }
     values.update(overrides)
     return module.SyncDecision(**values)
+
+
+@pytest.mark.parametrize("merge_state", ["CONFLICTING", "DIRTY"])
+def test_needs_rebase_label_target_adds_for_confirmed_conflicts(merge_state: str) -> None:
+    module = load_sync_module()
+
+    assert module.needs_rebase_label_target(merge_state, has_label=False) is True
+
+
+@pytest.mark.parametrize("merge_state", ["BEHIND", "BLOCKED", "CLEAN", "DRAFT", "HAS_HOOKS", "UNSTABLE"])
+def test_needs_rebase_label_target_removes_for_known_non_conflict_states(merge_state: str) -> None:
+    module = load_sync_module()
+
+    assert module.needs_rebase_label_target(merge_state, has_label=True) is False
+
+
+@pytest.mark.parametrize("has_label", [False, True])
+def test_needs_rebase_label_target_preserves_unknown_state(has_label: bool) -> None:
+    module = load_sync_module()
+
+    assert module.needs_rebase_label_target("UNKNOWN", has_label=has_label) is has_label
+
+
+def test_apply_decision_adds_needs_rebase_label(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_sync_module()
+    calls: list[tuple[str, str, Any | None]] = []
+
+    def capture_write(path: str, *, method: str = "GET", input_json: Any | None = None) -> None:
+        calls.append((method, path, input_json))
+
+    monkeypatch.setattr(module, "gh_api", capture_write)
+
+    warnings = module.apply_decision(
+        decision(
+            module,
+            ok_action="keep",
+            has_needs_rebase_label=False,
+            wants_needs_rebase_label=True,
+            needs_rebase_action="add",
+        )
+    )
+
+    assert warnings == ()
+    assert calls == [
+        (
+            "POST",
+            "/repos/Soju06/codex-lb/issues/714/labels",
+            {"labels": ["needs rebase"]},
+        )
+    ]
+
+
+def test_apply_decision_removes_stale_needs_rebase_label(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_sync_module()
+    calls: list[tuple[str, str, Any | None]] = []
+
+    def capture_write(path: str, *, method: str = "GET", input_json: Any | None = None) -> None:
+        calls.append((method, path, input_json))
+
+    monkeypatch.setattr(module, "gh_api", capture_write)
+
+    warnings = module.apply_decision(
+        decision(
+            module,
+            ok_action="keep",
+            has_needs_rebase_label=True,
+            wants_needs_rebase_label=False,
+            needs_rebase_action="remove",
+        )
+    )
+
+    assert warnings == ()
+    assert calls == [
+        (
+            "DELETE",
+            "/repos/Soju06/codex-lb/issues/714/labels/needs%20rebase",
+            None,
+        )
+    ]
 
 
 def test_classify_check_state_uses_latest_run_for_duplicate_check_names() -> None:
@@ -256,6 +338,81 @@ def test_classify_check_state_keeps_newer_same_workflow_run_pending_before_requi
     )
 
 
+def test_classify_check_state_keeps_manual_rerun_of_older_run_pending() -> None:
+    module = load_sync_module()
+
+    check_runs = [
+        {
+            "name": "CI Required",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-07-10T06:50:20Z",
+            "completed_at": "2026-07-10T06:59:05Z",
+            "details_url": "https://github.com/Soju06/codex-lb/actions/runs/200/job/4",
+            "_github_actions_workflow_id": "ci",
+            "_github_actions_run_created_at": "2026-07-10T06:50:00Z",
+            "_github_actions_run_started_at": "2026-07-10T06:50:00Z",
+        },
+        {
+            "name": "Detect changes",
+            "status": "in_progress",
+            "conclusion": None,
+            "started_at": "2026-07-10T07:10:20Z",
+            "details_url": "https://github.com/Soju06/codex-lb/actions/runs/100/job/1",
+            "_github_actions_workflow_id": "ci",
+            "_github_actions_run_created_at": "2026-07-10T06:00:00Z",
+            "_github_actions_run_started_at": "2026-07-10T07:10:00Z",
+        },
+    ]
+
+    assert (
+        module.classify_check_state(
+            check_runs,
+            {"statuses": []},
+            required_check_names=frozenset({"CI Required"}),
+        )
+        == "pending"
+    )
+
+
+def test_classify_check_state_keeps_failure_from_manual_rerun_of_older_run() -> None:
+    module = load_sync_module()
+
+    check_runs = [
+        {
+            "name": "CI Required",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-07-10T06:50:20Z",
+            "completed_at": "2026-07-10T06:59:05Z",
+            "details_url": "https://github.com/Soju06/codex-lb/actions/runs/200/job/4",
+            "_github_actions_workflow_id": "ci",
+            "_github_actions_run_created_at": "2026-07-10T06:50:00Z",
+            "_github_actions_run_started_at": "2026-07-10T06:50:00Z",
+        },
+        {
+            "name": "CI Required",
+            "status": "completed",
+            "conclusion": "failure",
+            "started_at": "2026-07-10T07:10:20Z",
+            "completed_at": "2026-07-10T07:15:05Z",
+            "details_url": "https://github.com/Soju06/codex-lb/actions/runs/100/job/4",
+            "_github_actions_workflow_id": "ci",
+            "_github_actions_run_created_at": "2026-07-10T06:00:00Z",
+            "_github_actions_run_started_at": "2026-07-10T07:10:00Z",
+        },
+    ]
+
+    assert (
+        module.classify_check_state(
+            check_runs,
+            {"statuses": []},
+            required_check_names=frozenset({"CI Required"}),
+        )
+        == "failure"
+    )
+
+
 def test_classify_check_state_keeps_failure_from_independent_workflow_run() -> None:
     module = load_sync_module()
 
@@ -307,7 +464,11 @@ def test_annotate_github_actions_workflow_ids_is_conservative_when_metadata_look
 
     def workflow_run(path: str) -> dict[str, int | str]:
         if path.endswith("/200"):
-            return {"workflow_id": 10, "created_at": "2026-07-10T06:00:43Z"}
+            return {
+                "workflow_id": 10,
+                "created_at": "2026-07-10T06:00:43Z",
+                "run_started_at": "2026-07-10T07:10:00Z",
+            }
         raise module.GhError("metadata unavailable")
 
     monkeypatch.setattr(module, "gh_api", workflow_run)
@@ -315,7 +476,7 @@ def test_annotate_github_actions_workflow_ids_is_conservative_when_metadata_look
     annotated = module.annotate_github_actions_workflow_ids("Soju06/codex-lb", check_runs)
 
     assert annotated[0]["_github_actions_workflow_id"] == "10"
-    assert annotated[0]["_github_actions_run_created_at"] == "2026-07-10T06:00:43Z"
+    assert annotated[0]["_github_actions_run_started_at"] == "2026-07-10T07:10:00Z"
     assert "_github_actions_workflow_id" not in annotated[1]
 
 
@@ -761,3 +922,112 @@ def test_unresolved_inline_codex_finding_counts_as_review_news(
 
     assert len(nodes) == 1
     assert nodes[0]["url"] == url
+
+
+def _rate_limited_proc() -> Any:
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "gh: API rate limit exceeded for user ID 34199905 (HTTP 403)"
+
+    return _Proc()
+
+
+def _ok_proc(payload: str = "{}") -> Any:
+    class _Proc:
+        returncode = 0
+        stdout = payload
+        stderr = ""
+
+    return _Proc()
+
+
+def _transient_gh_proc() -> Any:
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "gh: HTTP 503"
+
+    return _Proc()
+
+
+def test_run_gh_switches_to_fallback_token_on_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_sync_module()
+    monkeypatch.setenv("GH_TOKEN", "primary-token")
+    monkeypatch.setenv("GH_FALLBACK_TOKEN", "fallback-token")
+
+    calls: list[str] = []
+
+    def fake_run(command: Any, **kwargs: Any) -> Any:
+        import os
+
+        calls.append(os.environ["GH_TOKEN"])
+        if len(calls) == 1:
+            return _rate_limited_proc()
+        return _ok_proc()
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_gh(["api", "/rate-limited-path"])
+
+    assert result == {}
+    assert calls == ["primary-token", "fallback-token"]
+
+
+def test_run_gh_retries_transient_read_only_api_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_sync_module()
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> Any:
+        del kwargs
+        calls.append(command)
+        if len(calls) == 1:
+            return _transient_gh_proc()
+        return _ok_proc('{"ok": true}')
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module.time, "sleep", sleeps.append)
+
+    assert module.run_gh(["api", "/repos/example/project/issues/1/labels"]) == {"ok": True}
+    assert len(calls) == 2
+    assert sleeps == [2.0]
+
+
+def test_run_gh_does_not_retry_mutating_pr_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_sync_module()
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> Any:
+        del kwargs
+        calls.append(command)
+        return _transient_gh_proc()
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+
+    with pytest.raises(module.GhError):
+        module.run_gh(["pr", "comment", "1344", "--body", "@codex review"])
+    assert len(calls) == 1
+
+
+def test_run_gh_fails_without_distinct_fallback_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_sync_module()
+    monkeypatch.setenv("GH_TOKEN", "primary-token")
+    monkeypatch.setenv("GH_FALLBACK_TOKEN", "primary-token")
+
+    monkeypatch.setattr(module.subprocess, "run", lambda command, **kwargs: _rate_limited_proc())
+
+    with pytest.raises(module.GhError):
+        module.run_gh(["api", "/rate-limited-path"])
+
+
+def test_run_gh_fails_when_fallback_token_is_also_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_sync_module()
+    monkeypatch.setenv("GH_TOKEN", "primary-token")
+    monkeypatch.setenv("GH_FALLBACK_TOKEN", "fallback-token")
+
+    monkeypatch.setattr(module.subprocess, "run", lambda command, **kwargs: _rate_limited_proc())
+
+    with pytest.raises(module.GhError):
+        module.run_gh(["api", "/rate-limited-path"])

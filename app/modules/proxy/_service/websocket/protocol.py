@@ -35,14 +35,17 @@ class _WebSocketServiceProtocol(Protocol):
     _process_upstream_websocket_text: Any
     _raise_for_unsupported_input_image_references: Any
     _refresh_websocket_api_key_policy: Any
+    _revalidate_open_websocket_account: Any
     _relay_upstream_websocket_messages: Any
     _release_websocket_request_state_reservation: Any
     _release_websocket_reservation: Any
+    _release_request_state_account_response_create_lease: Any
     _remember_websocket_previous_response_owner: Any
     _remember_websocket_previous_response_owner_miss: Any
     _repo_factory: Any
     _reserve_websocket_api_key_usage: Any
     _resolve_file_account_for_responses: Any
+    _resolve_compact_turn_state_owner: Any
     _resolve_upstream_route_for_account: Any
     _resolve_websocket_previous_response_owner: Any
     _retry_websocket_connect_after_401: Any

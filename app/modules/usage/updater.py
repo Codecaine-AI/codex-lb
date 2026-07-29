@@ -15,7 +15,9 @@ from app.core.auth.refresh import RefreshError
 from app.core.balancer import (
     PERMANENT_FAILURE_CODES,
     QUOTA_EXCEEDED_COOLDOWN_SECONDS,
+    RATE_LIMITED_MIN_COOLDOWN_SECONDS,
     account_status_for_permanent_failure,
+    plausible_rate_limit_reset_at,
 )
 from app.core.clients.usage import UsageFetchError, fetch_usage
 from app.core.config.settings import get_settings
@@ -33,7 +35,7 @@ from app.modules.accounts.repository import AccountsRepository as SessionAccount
 from app.modules.proxy.account_cache import get_account_selection_cache, mark_account_routing_unavailable
 from app.modules.usage.additional_quota_keys import canonicalize_additional_quota_key
 from app.modules.usage.background_repository import BackgroundAdditionalUsageRepository, BackgroundUsageRepository
-from app.modules.usage.repository import AdditionalUsageRepository
+from app.modules.usage.repository import AdditionalUsageRepository, UsageWindowWrite
 from app.modules.usage.repository import UsageRepository as SessionUsageRepository
 
 logger = logging.getLogger(__name__)
@@ -47,20 +49,13 @@ class UsageRepositoryPort(Protocol):
         window: str | None = None,
     ) -> UsageHistory | None: ...
 
-    async def add_entry(
+    async def add_account_snapshot(
         self,
         account_id: str,
-        used_percent: float,
-        input_tokens: int | None = None,
-        output_tokens: int | None = None,
+        windows: Collection[UsageWindowWrite],
+        *,
         recorded_at: datetime | None = None,
-        window: str | None = None,
-        reset_at: int | None = None,
-        window_minutes: int | None = None,
-        credits_has: bool | None = None,
-        credits_unlimited: bool | None = None,
-        credits_balance: float | None = None,
-    ) -> UsageHistory | None: ...
+    ) -> list[UsageHistory]: ...
 
 
 class AdditionalUsageRepositoryPort(Protocol):
@@ -127,6 +122,7 @@ class AccountsRepositoryWithStatusComparePort(AccountsRepositoryPort, Protocol):
         expected_deactivation_reason: str | None = None,
         expected_reset_at: int | None = None,
         expected_blocked_at: int | None = None,
+        expected_refresh_token_encrypted: bytes | None = None,
     ) -> bool: ...
 
 
@@ -275,7 +271,12 @@ class UsageUpdater:
                 continue
             latest = await self._freshness_usage_entry(account, latest_usage.get(account.id))
             bypass_freshness = _quota_recovery_should_bypass_freshness(account, latest=latest)
-            if not bypass_freshness and _latest_usage_is_fresh(latest, now=now, interval_seconds=interval):
+            if not bypass_freshness and await self._usage_is_fresh_with_siblings(
+                account,
+                latest,
+                now=now,
+                interval_seconds=interval,
+            ):
                 continue
             # Additional-only accounts have no main UsageHistory entry.
             # Check DB-backed freshness (works across workers/restarts)
@@ -357,11 +358,26 @@ class UsageUpdater:
         access_token_override: str | None = None,
     ) -> bool:
         """Refresh one account regardless of cached/fresh usage rows."""
+        result = await self.force_refresh_result(
+            account,
+            ignore_refresh_disabled=ignore_refresh_disabled,
+            access_token_override=access_token_override,
+        )
+        return result.usage_written
+
+    async def force_refresh_result(
+        self,
+        account: Account,
+        *,
+        ignore_refresh_disabled: bool = False,
+        access_token_override: str | None = None,
+    ) -> AccountRefreshResult:
+        """Refresh one account and expose whether the upstream fetch completed."""
         settings = get_settings()
         if not settings.usage_refresh_enabled and not ignore_refresh_disabled:
-            return False
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
         if account.status in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
-            return False
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
         try:
             result = await _USAGE_REFRESH_SINGLEFLIGHT.run(
                 account.id,
@@ -376,7 +392,7 @@ class UsageUpdater:
             if result.fetch_succeeded:
                 _last_successful_refresh[account.id] = utcnow()
                 _clear_usage_refresh_auth_cooldown(account.id)
-            return result.usage_written
+            return result
         except Exception as exc:
             logger.warning(
                 "Forced usage refresh failed account_id=%s request_id=%s error=%s",
@@ -385,7 +401,7 @@ class UsageUpdater:
                 exc,
                 exc_info=True,
             )
-            return False
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
 
     async def _refresh_account_if_stale(
         self,
@@ -396,16 +412,34 @@ class UsageUpdater:
     ) -> AccountRefreshResult:
         primary_latest = await self._usage_repo.latest_entry_for_account(account.id, window="primary")
         latest = await self._freshness_usage_entry(account, primary_latest)
-        if not _quota_recovery_should_bypass_freshness(account, latest=latest) and _latest_usage_is_fresh(
-            latest,
-            now=utcnow(),
-            interval_seconds=interval_seconds,
-        ):
-            return AccountRefreshResult(usage_written=False)
+        if not _quota_recovery_should_bypass_freshness(account, latest=latest):
+            if await self._usage_is_fresh_with_siblings(
+                account,
+                latest,
+                now=utcnow(),
+                interval_seconds=interval_seconds,
+            ):
+                return AccountRefreshResult(usage_written=False)
         return await self._refresh_account(
             account,
             usage_account_id=usage_account_id,
         )
+
+    async def _additional_usage_is_stale(self, account_id: str, *, now: datetime, interval_seconds: int) -> bool:
+        # The upstream fetch is the only path that syncs additional
+        # (per-model) rate limits; live main-window rows must not keep an
+        # account "fresh" while its additional rows age past the interval,
+        # or gated-model routing starves on additional_quota_data_unavailable.
+        if self._additional_usage_repo is None:
+            return False
+        latest_at = await self._additional_usage_repo.latest_recorded_at_for_account(account_id)
+        if latest_at is None:
+            # No additional rows ever fetched: live rows alone must not
+            # suppress the fetch, or a first gated-model use would never be
+            # discovered. Non-gated accounts simply keep the pre-live poll
+            # cadence.
+            return True
+        return (now - latest_at).total_seconds() >= interval_seconds
 
     async def _freshness_usage_entry(self, account: Account, latest: UsageHistory | None) -> UsageHistory | None:
         if latest is not None:
@@ -413,6 +447,46 @@ class UsageUpdater:
         if usage_core.capacity_for_plan(account.plan_type, "monthly") is None:
             return None
         return await self._usage_repo.latest_entry_for_account(account.id, window="monthly")
+
+    async def _usage_is_fresh_with_siblings(
+        self,
+        account: Account,
+        latest: UsageHistory | None,
+        *,
+        now: datetime,
+        interval_seconds: int,
+    ) -> bool:
+        if _latest_usage_is_fresh(latest, now=now, interval_seconds=interval_seconds):
+            return not await self._additional_usage_is_stale(account.id, now=now, interval_seconds=interval_seconds)
+        # A stale (or elapsed-reset) newest row of one window must not
+        # permanently defeat freshness once upstream stops reporting that
+        # window: a strictly newer sibling-window row proves a later fetch
+        # happened without rewriting the stale window, so the newest row's
+        # own freshness governs the account instead. When no primary-slot
+        # row exists at all (upstream omitted the short window from the
+        # first fetch), any sibling row is that proof.
+        newest = latest
+        for window in _MAIN_USAGE_WINDOWS:
+            if latest is not None and window == latest.window:
+                continue
+            if window == "monthly" and usage_core.capacity_for_plan(account.plan_type, "monthly") is None:
+                # A lingering monthly row from a former plan (e.g. after a
+                # free-to-paid upgrade) is not applicable usage and must not
+                # suppress refreshes.
+                continue
+            sibling = await self._usage_repo.latest_entry_for_account(account.id, window=window)
+            if sibling is not None and (newest is None or sibling.recorded_at > newest.recorded_at):
+                newest = sibling
+        if newest is None or newest is latest:
+            return False
+        if (
+            latest is not None
+            and (newest.recorded_at - latest.recorded_at).total_seconds() <= usage_core.SIBLING_FETCH_MARGIN_SECONDS
+        ):
+            return False
+        if not _latest_usage_is_fresh(newest, now=now, interval_seconds=interval_seconds):
+            return False
+        return not await self._additional_usage_is_stale(account.id, now=now, interval_seconds=interval_seconds)
 
     async def _refresh_account_if_stale_with_owned_session(
         self,
@@ -609,49 +683,49 @@ class UsageUpdater:
             additional_synced = self._additional_usage_repo is not None and payload.additional_rate_limits is not None
             return AccountRefreshResult(usage_written=additional_synced)
         credits_has, credits_unlimited, credits_balance = _credits_snapshot(payload)
-        usage_written = False
+        snapshot_windows: list[UsageWindowWrite] = []
 
         if primary and primary.used_percent is not None:
-            entry = await self._usage_repo.add_entry(
-                account_id=account.id,
-                used_percent=float(primary.used_percent),
-                input_tokens=None,
-                output_tokens=None,
-                window="primary",
-                reset_at=_reset_at(primary.reset_at, primary.reset_after_seconds, now_epoch),
-                window_minutes=_window_minutes(primary.limit_window_seconds),
-                credits_has=credits_has,
-                credits_unlimited=credits_unlimited,
-                credits_balance=credits_balance,
+            snapshot_windows.append(
+                UsageWindowWrite(
+                    window="primary",
+                    used_percent=float(primary.used_percent),
+                    reset_at=_reset_at(primary.reset_at, primary.reset_after_seconds, now_epoch),
+                    window_minutes=_window_minutes(primary.limit_window_seconds),
+                    credits_has=credits_has,
+                    credits_unlimited=credits_unlimited,
+                    credits_balance=credits_balance,
+                )
             )
-            usage_written = usage_written or _usage_entry_written(entry)
 
         if secondary and secondary.used_percent is not None:
-            entry = await self._usage_repo.add_entry(
-                account_id=account.id,
-                used_percent=float(secondary.used_percent),
-                input_tokens=None,
-                output_tokens=None,
-                window="secondary",
-                reset_at=_reset_at(secondary.reset_at, secondary.reset_after_seconds, now_epoch),
-                window_minutes=_window_minutes(secondary.limit_window_seconds),
+            snapshot_windows.append(
+                UsageWindowWrite(
+                    window="secondary",
+                    used_percent=float(secondary.used_percent),
+                    reset_at=_reset_at(secondary.reset_at, secondary.reset_after_seconds, now_epoch),
+                    window_minutes=_window_minutes(secondary.limit_window_seconds),
+                )
             )
-            usage_written = usage_written or _usage_entry_written(entry)
 
         if monthly and monthly.used_percent is not None:
-            entry = await self._usage_repo.add_entry(
-                account_id=account.id,
-                used_percent=float(monthly.used_percent),
-                input_tokens=None,
-                output_tokens=None,
-                window="monthly",
-                reset_at=_reset_at(monthly.reset_at, monthly.reset_after_seconds, now_epoch),
-                window_minutes=_window_minutes(monthly.limit_window_seconds),
-                credits_has=credits_has,
-                credits_unlimited=credits_unlimited,
-                credits_balance=credits_balance,
+            snapshot_windows.append(
+                UsageWindowWrite(
+                    window="monthly",
+                    used_percent=float(monthly.used_percent),
+                    reset_at=_reset_at(monthly.reset_at, monthly.reset_after_seconds, now_epoch),
+                    window_minutes=_window_minutes(monthly.limit_window_seconds),
+                    credits_has=credits_has,
+                    credits_unlimited=credits_unlimited,
+                    credits_balance=credits_balance,
+                )
             )
-            usage_written = usage_written or _usage_entry_written(entry)
+
+        entries = await self._usage_repo.add_account_snapshot(
+            account.id,
+            snapshot_windows,
+        )
+        usage_written = any(_usage_entry_written(entry) for entry in entries)
         await self._recover_quota_status_from_usage(account, primary=primary, secondary=secondary, monthly=monthly)
         return AccountRefreshResult(usage_written=usage_written)
 
@@ -715,12 +789,13 @@ class UsageUpdater:
         if not self._auth_manager:
             return True
 
-        await self._auth_manager._repo.update_tokens(
+        # Identity/plan/workspace sync only. This runs against a stale in-memory
+        # ``account`` snapshot taken well before the write, so it MUST route
+        # through the metadata-only writer, which structurally cannot touch
+        # token ciphertext. Persisting token material from this snapshot would
+        # clobber a peer replica's concurrent refresh-token rotation.
+        await self._auth_manager._repo.update_account_metadata(
             account.id,
-            access_token_encrypted=account.access_token_encrypted,
-            refresh_token_encrypted=account.refresh_token_encrypted,
-            id_token_encrypted=account.id_token_encrypted,
-            last_refresh=account.last_refresh,
             plan_type=account.plan_type,
             email=account.email,
             chatgpt_account_id=account.chatgpt_account_id,
@@ -741,6 +816,23 @@ class UsageUpdater:
         if not self._auth_manager:
             return
         if account.status == AccountStatus.RATE_LIMITED:
+            if account.blocked_at is not None:
+                # An account marked RATE_LIMITED by an actual 429 always
+                # carries a blocked_at marker. Honor the persisted cooldown
+                # deadline (Retry-After hint, upstream reset metadata, or the
+                # backoff floor) so the periodic usage refresh cannot flip the
+                # account back to ACTIVE — erasing reset_at that peer replicas
+                # rely on — while the upstream cooldown is still running.
+                # Fresh usage showing quota is not evidence the 429 window
+                # ended: throttles are not always quota-based. Rows without
+                # blocked_at are stale window-derived markings and keep the
+                # fresh-usage recovery below.
+                now = time.time()
+                cooldown_deadline = plausible_rate_limit_reset_at(account.reset_at, now=now) or (
+                    float(account.blocked_at) + RATE_LIMITED_MIN_COOLDOWN_SECONDS
+                )
+                if now < cooldown_deadline:
+                    return
             long_window = monthly or secondary
             if primary is None and monthly is None:
                 return
@@ -847,20 +939,20 @@ def _payload_mismatches_account_slot(account: Account, payload: UsagePayload) ->
         normalized_payload_plan_type = normalize_account_plan_type(payload.plan_type)
         stored_plan_type = coerce_account_plan_type(account.plan_type, "free")
         recognized_paid_plans = ACCOUNT_PLAN_TYPES - {"free"}
-        # A transition between two recognized paid plans (e.g. Plus -> Pro) is a
-        # legitimate upgrade/downgrade, not an identity mismatch: the usage
-        # payload carries no independent account identifier and is fetched per
-        # account token, so plan_type alone cannot establish identity. Persist
-        # those via _sync_identity_metadata (issue #1086). A workspace-less
-        # payload that instead introduces "free" or an unrecognized plan stays
-        # untrusted -- the signature of a degraded or wrong-identity usage
-        # response that must not silently rewrite the stored plan.
+        # A transition from free into a recognized paid plan (e.g. Free -> Plus)
+        # or between paid plans (e.g. Plus -> Pro) is a legitimate plan change,
+        # not an identity mismatch: the usage payload carries no independent
+        # account identifier and is fetched per-account token, so plan_type alone
+        # cannot establish identity. A workspace-less payload that instead
+        # introduces "free" or an unrecognized plan stays untrusted -- the
+        # signature of a degraded or wrong-identity usage response that must not
+        # silently rewrite the stored plan.
         if payload_plan_type != stored_plan_type and not (
             stored_plan_type == "unknown"
             and normalized_payload_plan_type in recognized_paid_plans
             or (
                 not account.workspace_id
-                and stored_plan_type in recognized_paid_plans
+                and stored_plan_type in ACCOUNT_PLAN_TYPES
                 and payload_plan_type in recognized_paid_plans
             )
         ):
@@ -1055,6 +1147,9 @@ def _latest_usage_is_fresh(
         if now_epoch >= latest.reset_at:
             return False
     return True
+
+
+_MAIN_USAGE_WINDOWS = ("primary", "secondary", "monthly")
 
 
 def _quota_recovery_should_bypass_freshness(account: Account, *, latest: UsageHistory | None) -> bool:

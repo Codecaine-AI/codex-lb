@@ -68,6 +68,7 @@ changes). Layers should be individually re-buildable on top of
 
 | Path | Layer | What the edit is |
 |------|-------|------------------|
+| `.github/simplicity-budgets.toml` | `dashboard-restructure`, `usage-share-image` | `core_nav` `max_items` raised 5 → 7 for the two fork nav items (Requests, Share). |
 | `frontend/src/App.tsx` | `dashboard-restructure` | Route swap: `/dashboard` renders `ForkDashboardPage`; `/requests` renders `ForkRequestLogsPage`; upstream page moved to `/upstream-dashboard` (two imports + three route lines). |
 | `frontend/src/App.tsx` | `usage-share-image` | One import + one route line: `/share-lab` renders `ForkShareLabPage` (not in nav). |
 | `app/modules/reports/repository.py` | `usage-share-image` | By-model aggregate also sums input+output tokens (`ModelAggregateRow.tokens`). |
@@ -88,6 +89,7 @@ changes). Layers should be individually re-buildable on top of
 | `frontend/src/hooks/use-dashboard-preferences.ts` | `dashboard-restructure` | New persisted `forkDiagnosticsOpen` preference (key `codex-lb-fork-diagnostics-open`) following the existing burnrate pattern. |
 | `frontend/src/__integration__/dashboard-flow.test.tsx` | `dashboard-restructure` | Upstream dashboard-flow integration test now targets `/upstream-dashboard` (URL strings only) since `/dashboard` renders the fork page with a 1d default timeframe. |
 | `frontend/src/features/reports/components/model-distribution-donut.test.tsx` | `usage-share-image` | Upstream donut test fixture includes the additive `tokens` field expected by fork report schemas. |
+| `frontend/src/__integration__/reports-date-range-flow.test.tsx` | `usage-share-image` | Upstream test fixture includes the additive `tokens` field expected by fork report schemas. |
 | `app/modules/accounts/repository.py` | `fix-targeted-oauth-reauth` | Adds targeted `reauthenticate_account` persistence with ChatGPT/email identity mismatch protection. |
 | `app/modules/oauth/api.py` | `fix-targeted-oauth-reauth` | Preserves `OAuthError.status_code` so missing re-auth targets return 404 instead of a generic 502. |
 | `app/modules/oauth/schemas.py` | `fix-targeted-oauth-reauth` | Adds optional `reauth_account_id` to OAuth start requests. |

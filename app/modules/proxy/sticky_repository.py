@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +23,15 @@ from app.modules.sticky_sessions.schemas import StickySessionSortBy, StickySessi
 # ships with current Python interpreters. Postgres allows up to 65535
 # bind parameters, which this chunk size also respects.
 _DELETE_ENTRIES_CHUNK_SIZE = 250
+
+# Only the Live-call ownership namespace is reserved. Other LF-prefixed keys
+# (e.g. the pre-existing "\ncodex-lb-affinity-v1" selection affinities) remain
+# ordinary operator-manageable sessions.
+RESERVED_STICKY_SESSION_KEY_PREFIX = "\ncodex_live_call:"
+
+
+def is_reserved_sticky_session_key(key: str) -> bool:
+    return key.startswith(RESERVED_STICKY_SESSION_KEY_PREFIX)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,12 +56,52 @@ class StickySessionsRepository:
         row = await self.get_entry(key, kind=kind)
         if row is None:
             return None
-        if max_age_seconds is not None:
-            cutoff = utcnow() - timedelta(seconds=max_age_seconds)
-            if to_utc_naive(row.updated_at) < cutoff:
-                await self.delete(key, kind=kind)
-                return None
-        return row.account_id
+        if max_age_seconds is None:
+            return row.account_id
+        cutoff = utcnow() - timedelta(seconds=max_age_seconds)
+        observed_updated_at = to_utc_naive(row.updated_at)
+        if observed_updated_at >= cutoff:
+            return row.account_id
+
+        # Release the read snapshot before attempting a SQLite write upgrade.
+        # The DELETE remains safe because every value observed above participates
+        # in the predicate; a concurrent rebind therefore wins the comparison.
+        await self._session.commit()
+        statement = (
+            delete(StickySession)
+            .where(
+                StickySession.key == key,
+                StickySession.kind == kind,
+                StickySession.account_id == row.account_id,
+                StickySession.updated_at == observed_updated_at,
+                StickySession.updated_at < cutoff,
+            )
+            .returning(StickySession.key)
+        )
+        current: tuple[str, datetime] | None = None
+        async with sqlite_writer_section():
+            deleted_key = (await self._session.execute(statement)).scalar_one_or_none()
+            if deleted_key is None:
+                current = (
+                    (
+                        await self._session.execute(
+                            select(StickySession.account_id, StickySession.updated_at).where(
+                                StickySession.key == key,
+                                StickySession.kind == kind,
+                            )
+                        )
+                    )
+                    .tuples()
+                    .one_or_none()
+                )
+            await self._session.commit()
+
+        if deleted_key is not None or current is None:
+            return None
+        current_account_id, current_updated_at = current
+        if to_utc_naive(current_updated_at) < cutoff:
+            return None
+        return current_account_id
 
     async def get_entry(self, key: str, *, kind: StickySessionKind) -> StickySession | None:
         if not key:
@@ -65,15 +114,38 @@ class StickySessionsRepository:
         return result.scalar_one_or_none()
 
     async def upsert(self, key: str, account_id: str, *, kind: StickySessionKind) -> StickySession:
-        statement = self._build_upsert_statement(key, account_id, kind)
+        # RETURNING collapses the previous upsert + re-select + refresh
+        # (4 round trips) into one statement; this runs inline before the
+        # first upstream byte on sticky requests, so round trips are TTFT.
+        # populate_existing forces the returned row to overwrite any stale
+        # identity-map instance the session may already hold for this key.
+        statement = self._build_upsert_statement(key, account_id, kind).returning(StickySession)
         async with sqlite_writer_section():
-            await self._session.execute(statement)
+            result = await self._session.execute(statement, execution_options={"populate_existing": True})
+            row = result.scalar_one_or_none()
             await self._session.commit()
-        row = await self.get_entry(key, kind=kind)
         if row is None:
             raise RuntimeError(f"StickySession upsert failed for key={key!r} kind={kind.value!r}")
-        await self._session.refresh(row)
         return row
+
+    async def insert_if_absent(self, key: str, account_id: str, kind: StickySessionKind) -> str:
+        """Insert immutable ownership and return the persisted owner."""
+
+        statement = self._build_insert_do_nothing_statement(key, account_id, kind).returning(StickySession.account_id)
+        async with sqlite_writer_section():
+            result = await self._session.execute(statement)
+            owner_id = result.scalar_one_or_none()
+            if owner_id is None:
+                owner_id = await self._session.scalar(
+                    select(StickySession.account_id).where(
+                        StickySession.key == key,
+                        StickySession.kind == kind,
+                    )
+                )
+            await self._session.commit()
+        if owner_id is None:
+            raise RuntimeError("StickySession immutable insert did not resolve an owner")
+        return owner_id
 
     async def delete(self, key: str, *, kind: StickySessionKind) -> bool:
         if not key:
@@ -84,6 +156,51 @@ class StickySessionsRepository:
         )
         async with sqlite_writer_section():
             result = await self._session.execute(statement.returning(StickySession.key))
+            await self._session.commit()
+        return result.scalar_one_or_none() is not None
+
+    async def restore_if_current(
+        self,
+        key: str,
+        *,
+        kind: StickySessionKind,
+        expected_account_id: str | None,
+        restore_account_id: str | None,
+    ) -> bool:
+        """Restore a sticky owner only if the provisional owner is still current."""
+
+        if not key:
+            return False
+        if expected_account_id is None:
+            if restore_account_id is None:
+                return True
+            statement = self._build_insert_do_nothing_statement(key, restore_account_id, kind).returning(
+                StickySession.key
+            )
+        elif restore_account_id is None:
+            statement = (
+                delete(StickySession)
+                .where(
+                    StickySession.key == key,
+                    StickySession.kind == kind,
+                    StickySession.account_id == expected_account_id,
+                )
+                .returning(StickySession.key)
+            )
+        else:
+            statement = (
+                update(StickySession)
+                .where(
+                    StickySession.key == key,
+                    StickySession.kind == kind,
+                    StickySession.account_id == expected_account_id,
+                )
+                .values(account_id=restore_account_id, updated_at=func.now())
+                .returning(StickySession.key)
+            )
+
+        async with sqlite_writer_section():
+            result = await self._session.execute(statement)
             await self._session.commit()
         return result.scalar_one_or_none() is not None
 
@@ -199,6 +316,38 @@ class StickySessionsRepository:
             await self._session.commit()
         return deleted
 
+    async def purge_before_for_key_prefix(
+        self,
+        cutoff: datetime,
+        *,
+        kind: StickySessionKind,
+        key_prefix: str,
+        limit: int = _DELETE_ENTRIES_CHUNK_SIZE,
+    ) -> int:
+        """Delete one bounded batch from a reserved key namespace."""
+
+        if limit <= 0:
+            return 0
+        target_keys = (
+            select(StickySession.key)
+            .where(
+                StickySession.kind == kind,
+                StickySession.key.startswith(key_prefix, autoescape=True),
+                StickySession.updated_at < to_utc_naive(cutoff),
+            )
+            .order_by(StickySession.updated_at.asc(), StickySession.key.asc())
+            .limit(limit)
+        )
+        stmt = delete(StickySession).where(
+            StickySession.kind == kind,
+            StickySession.key.in_(target_keys),
+        )
+        async with sqlite_writer_section():
+            result = await self._session.execute(stmt.returning(StickySession.key))
+            deleted = len(result.scalars().all())
+            await self._session.commit()
+        return deleted
+
     def _build_upsert_statement(self, key: str, account_id: str, kind: StickySessionKind) -> Insert:
         dialect = self._session.get_bind().dialect.name
         if dialect == "postgresql":
@@ -216,6 +365,17 @@ class StickySessionsRepository:
             },
         )
 
+    def _build_insert_do_nothing_statement(self, key: str, account_id: str, kind: StickySessionKind) -> Insert:
+        dialect = self._session.get_bind().dialect.name
+        if dialect == "postgresql":
+            insert_fn = pg_insert
+        elif dialect == "sqlite":
+            insert_fn = sqlite_insert
+        else:
+            raise RuntimeError(f"StickySession insert unsupported for dialect={dialect!r}")
+        statement = insert_fn(StickySession).values(key=key, account_id=account_id, kind=kind)
+        return statement.on_conflict_do_nothing(index_elements=[StickySession.key, StickySession.kind])
+
     @staticmethod
     def _apply_filters(
         statement,
@@ -225,6 +385,7 @@ class StickySessionsRepository:
         account_query: str | None,
         key_query: str | None,
     ):
+        statement = statement.where(~StickySession.key.startswith(RESERVED_STICKY_SESSION_KEY_PREFIX, autoescape=True))
         if kind is not None:
             statement = statement.where(StickySession.kind == kind)
         if updated_before is not None:

@@ -1,4 +1,5 @@
 import { Suspense, lazy, useCallback, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useSearchParams } from "react-router-dom";
 
 import { ConfirmDialog } from "@/components/confirm-dialog";
@@ -22,7 +23,7 @@ import {
   type AccountSortMode,
 } from "@/features/accounts/sorting";
 import { useOauth } from "@/features/accounts/hooks/use-oauth";
-import { useUpstreamProxyAdmin } from "@/features/settings/hooks/use-settings";
+import { useSettings, useUpstreamProxyAdmin } from "@/features/settings/hooks/use-settings";
 import { useAccountQuotaDisplayStore } from "@/hooks/use-account-quota-display";
 import type { AccountAuthExportResponse } from "@/features/accounts/schemas";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
@@ -35,8 +36,10 @@ const OauthDialog = lazy(() =>
 );
 
 export function AccountsPage() {
+  const { t } = useTranslation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [accountSortMode, setAccountSortMode] = useState<AccountSortMode>(DEFAULT_ACCOUNT_SORT_MODE);
+  const [oauthAccountId, setOauthAccountId] = useState<string | null>(null);
   const {
     accountsQuery,
     importMutation,
@@ -51,6 +54,7 @@ export function AccountsPage() {
     routingPolicyMutation,
     exportAuthMutation,
   } = useAccounts();
+  const { settingsQuery } = useSettings();
   const { upstreamProxyQuery, accountBindingMutation, testEndpointMutation } = useUpstreamProxyAdmin();
   const oauth = useOauth();
   const canWrite = useAuthStore((state) => state.canWrite);
@@ -69,6 +73,8 @@ export function AccountsPage() {
     () => accountsQuery.data ?? [],
     [accountsQuery.data],
   );
+  const showResetCreditBadges = settingsQuery.data?.showResetCreditBadges ?? true;
+  const showResetCreditExpiryBadge = settingsQuery.data?.showResetCreditExpiryBadge ?? true;
   const quotaDisplay = useAccountQuotaDisplayStore((s) => s.quotaDisplay);
   const sortedAccounts = useMemo(
     () => sortAccountsForDisplay(accounts, quotaDisplay, accountSortMode),
@@ -136,6 +142,7 @@ export function AccountsPage() {
     getErrorMessageOrNull(routingPolicyMutation.error) ||
     getErrorMessageOrNull(exportAuthMutation.error) ||
     getErrorMessageOrNull(updateMutation.error) ||
+    getErrorMessageOrNull(settingsQuery.error) ||
     getErrorMessageOrNull(upstreamProxyQuery.error) ||
     getErrorMessageOrNull(accountBindingMutation.error) ||
     getErrorMessageOrNull(testEndpointMutation.error);
@@ -144,9 +151,9 @@ export function AccountsPage() {
     <div className="animate-fade-in-up space-y-6">
       {/* Page header */}
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Accounts</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">{t("accounts.page.title")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Manage imported accounts and authentication flows.
+          {t("accounts.page.subtitle")}
         </p>
       </div>
 
@@ -163,18 +170,23 @@ export function AccountsPage() {
         >
           <div
             data-testid="accounts-list-panel"
-            className="min-w-0 min-h-0 h-full"
+            className="min-w-0 min-h-0 self-start"
           >
-            <div className="flex h-full min-h-0 min-w-0 flex-col rounded-xl border bg-card p-3 sm:p-4">
+            <div
+              data-testid="accounts-list-card"
+              className="flex min-h-0 min-w-0 flex-col rounded-xl border bg-card p-3 sm:p-4"
+            >
               <AccountList
                 accounts={accounts}
                 selectedAccountId={resolvedSelectedAccountId}
                 onSelect={handleSelectAccount}
                 sortMode={accountSortMode}
                 onSortModeChange={setAccountSortMode}
+                showResetCreditBadges={showResetCreditBadges}
                 onOpenImport={() => importDialog.show()}
                 onOpenOauth={() => {
                   setReauthAccountId(null);
+                  setOauthAccountId(null);
                   oauthDialog.show();
                 }}
                 readOnly={!canWrite}
@@ -197,6 +209,7 @@ export function AccountsPage() {
             onDelete={(accountId) => deleteDialog.show(accountId)}
             onReauth={(accountId) => {
               setReauthAccountId(accountId);
+              setOauthAccountId(accountId);
               oauthDialog.show();
             }}
             onExportAuth={(accountId) => {
@@ -212,6 +225,7 @@ export function AccountsPage() {
                 availableResetCredits: account?.availableResetCredits ?? 0,
               });
             }}
+            showResetCreditExpiryBadge={showResetCreditExpiryBadge}
             onLimitWarmupChange={(accountId, enabled) =>
               void limitWarmupMutation.mutateAsync({ accountId, enabled })
             }
@@ -257,10 +271,12 @@ export function AccountsPage() {
             oauthDialog.onOpenChange(open);
             if (!open) {
               setReauthAccountId(null);
+              setOauthAccountId(null);
             }
           }}
           onStart={async (method) => {
             await oauth.start(method, {
+              ...(oauthAccountId ? { accountId: oauthAccountId } : {}),
               ...(reauthAccountId ? { reauthAccountId } : {}),
             });
           }}
@@ -291,10 +307,10 @@ export function AccountsPage() {
 
       <ConfirmDialog
         open={deleteDialog.open}
-        title="Delete account"
-        description="This action removes the account from the load balancer configuration."
-        confirmLabel="Delete"
-        cancelLabel="Cancel"
+        title={t("accounts.deleteDialog.title")}
+        description={t("accounts.deleteDialog.description")}
+        confirmLabel={t("common.actions.delete")}
+        cancelLabel={t("common.cancel")}
         onOpenChange={(open) => {
           deleteDialog.onOpenChange(open);
           if (!open) setDeleteHistory(false);
@@ -321,17 +337,17 @@ export function AccountsPage() {
             htmlFor="delete-history"
             className="text-sm text-muted-foreground cursor-pointer"
           >
-            Delete all history for this account
+            {t("accounts.deleteDialog.deleteHistory")}
           </label>
         </div>
       </ConfirmDialog>
 
       <ConfirmDialog
         open={usageResetDialog.open}
-        title="Reset usage"
-        description="This consumes one upstream usage reset credit for the selected account, then fetches fresh usage."
-        confirmLabel="Reset"
-        cancelLabel="Cancel"
+        title={t("accounts.usageResetDialog.title")}
+        description={t("accounts.usageResetDialog.description")}
+        confirmLabel={t("common.actions.reset")}
+        cancelLabel={t("common.cancel")}
         onOpenChange={usageResetDialog.onOpenChange}
         onConfirm={() => {
           if (!usageResetDialog.data) {
@@ -347,7 +363,7 @@ export function AccountsPage() {
 
       <LoadingOverlay
         visible={!!accountsQuery.data && mutationBusy}
-        label="Updating accounts..."
+        label={t("accounts.page.updating")}
       />
     </div>
   );

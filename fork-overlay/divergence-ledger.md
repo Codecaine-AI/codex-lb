@@ -50,7 +50,7 @@ changes). Layers should be individually re-buildable on top of
 | `dashboard-restructure` | implemented | `dashboard-restructure` | Quota-first dashboard relayout: tokens/cost/requests stats, 5h+weekly gauges, accounts sectioned by quota state, banked reset-credit row actions, projections demoted to diagnostics. See [dashboard-restructure-design.md](dashboard-restructure-design.md). Frontend-only; fork-only page + additive route swap, no owned files. |
 | `usage-share-image` | prototyping | `usage-share-image` | Shareable usage-image cards (tokens / est. API cost / requests) for daily/weekly/monthly posting. Phase 1: `/share-lab` preview route rendering the hero + receipt candidates from live data (a gauge variant was prototyped and dropped); phase 2: share dialog with PNG export. Fork-only components + additive route line + additive backend by-model token sums in `/api/reports`. |
 | `fix-targeted-oauth-reauth` | implemented | `fix-targeted-oauth-reauth` | Dashboard re-auth actions carry the selected account id through OAuth and persist refreshed credentials back into that exact account after identity validation. Additive backend + account dashboard wiring. |
-| `usage-refresh-test-clock` | landed | — (test-only) | Test-only timestamp normalization for usage/account reset fixtures so syncs do not reintroduce naive local-time epoch drift. |
+| `usage-refresh-test-clock` | landed | — (test-only) | Test-only timestamp normalization for usage/account reset fixtures so syncs do not reintroduce naive local-time epoch drift. The `tests/unit/test_usage_updater.py` portion landed upstream as of the 2026-07-29 sync; only `tests/integration/test_accounts_api_extended.py` still diverges. |
 
 ## Fork-only files and directories
 
@@ -75,6 +75,7 @@ changes). Layers should be individually re-buildable on top of
 | `app/modules/reports/schemas.py` | `usage-share-image` | `ModelCostEntry.tokens` response field (default 0, backward compatible). |
 | `app/modules/reports/service.py` | `usage-share-image` | Passes the by-model token sum through to the response. |
 | `tests/integration/test_reports_api.py` | `usage-share-image` | By-model assertions include the new `tokens` field. |
+| `tests/unit/test_reports_service.py` | `usage-share-image` | By-model fixture includes the additive `tokens` field expected by fork report schemas. |
 | `frontend/src/features/reports/schemas.ts` | `usage-share-image` | `tokens` field (optional, default 0) on `ModelCostEntrySchema`. |
 | `frontend/src/features/reports/components/reports-page.test.tsx` | `usage-share-image` | Test fixtures gain the `tokens` field. |
 | `frontend/src/test/mocks/factories.ts` | `usage-share-image` | `createReportsResponse` factory added. |
@@ -104,7 +105,6 @@ changes). Layers should be individually re-buildable on top of
 | `frontend/src/test/mocks/handlers.ts` | `fix-targeted-oauth-reauth` | MSW OAuth start payload schema accepts `reauthAccountId`. |
 | `tests/integration/test_oauth_flow.py` | `fix-targeted-oauth-reauth` | Backend regression coverage for targeted reauth success and identity mismatch failure. |
 | `tests/integration/test_accounts_api_extended.py` | `usage-refresh-test-clock` | Account reset fixtures use UTC epoch conversion helpers instead of local-time `timestamp()` calls. |
-| `tests/unit/test_usage_updater.py` | `usage-refresh-test-clock` | Usage freshness fixture records timestamps with the project UTC clock helper. |
 
 ## Upstream files modified — owned
 

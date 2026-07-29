@@ -114,7 +114,9 @@ changes). Layers should be individually re-buildable on top of
 
 ## Upstream sync checklist
 
-Run on every `git merge upstream/main` into `ford/main`:
+Run on every `git merge upstream/main` into `ford/main`. The full operational
+runbook (backup, build, deploy, verify) is in
+[update-runbook.md](update-runbook.md):
 
 1. `git fetch upstream --tags && git switch ford/main && git merge upstream/main`
    (`rerere` is enabled and will replay known conflict resolutions).

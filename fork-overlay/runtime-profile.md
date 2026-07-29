@@ -13,20 +13,8 @@ which is intentionally ignored in this checkout.
 - Treat the data volume as the durable asset; containers and images are
   disposable.
 
-Safe local rebuild loop:
-
-```bash
-git fetch upstream --tags
-git switch ford/main
-git merge upstream/main
-
-short_sha="$(git rev-parse --short=12 HEAD)"
-docker build --pull \
-  -t codex-lb:local-main \
-  -t "codex-lb:main-$short_sha" \
-  .
-docker compose -f docker-compose.runtime.yml up -d
-```
+The full rebuild/update loop (backup → merge → validate → build → deploy →
+verify) lives in the [update runbook](update-runbook.md).
 
 ## Auth Stance
 

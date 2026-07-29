@@ -15,22 +15,17 @@ to grow its own product layer.
 - `ford/main` is the fork integration branch for overlay work.
 - `main` tracks upstream and is useful as a clean comparison point.
 
-Normal upstream update flow:
-
-```bash
-git fetch upstream --tags
-git switch ford/main
-git merge upstream/main
-openspec validate --specs
-git push
-```
-
-For heavier conflicts, resolve once and let `git rerere` remember the fix for
-future upstream merges. The full per-sync checklist and per-file conflict
-rules live in the [divergence ledger](divergence-ledger.md).
+The full update procedure (backup → merge → validate → build → deploy →
+verify) lives in the [update runbook](update-runbook.md). For heavier
+conflicts, resolve once and let `git rerere` remember the fix for future
+upstream merges. Per-file conflict rules live in the
+[divergence ledger](divergence-ledger.md).
 
 ## Contents
 
+- [update-runbook.md](update-runbook.md): canonical procedure for updating the
+  local deployment from upstream — backup, merge, validate, build, deploy,
+  verify, rollback, sync log.
 - [divergence-ledger.md](divergence-ledger.md): SSOT for everything this fork
   changes relative to upstream — fork layers, modified upstream files with
   merge rules, and the upstream sync checklist.

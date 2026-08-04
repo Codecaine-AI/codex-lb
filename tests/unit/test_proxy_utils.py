@@ -12558,12 +12558,20 @@ async def test_stream_with_retry_post_refresh_transport_failure_retries_same_acc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "replacement_outcome",
-    ["success", "model_rejection", "surface", "visible_surface", "second_transient_exhaustion"],
+    ("replacement_outcome", "settlement_confirmed"),
+    [
+        ("success", True),
+        ("model_rejection", True),
+        ("surface", True),
+        ("visible_surface", True),
+        ("second_transient_exhaustion", True),
+        ("success", False),
+    ],
 )
 async def test_stream_with_retry_post_refresh_transient_exhaustion_fails_over(
     monkeypatch,
     replacement_outcome: str,
+    settlement_confirmed: bool,
 ):
     settings = _make_proxy_settings()
     service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
@@ -12585,10 +12593,12 @@ async def test_stream_with_retry_post_refresh_transient_exhaustion_fails_over(
         model="gpt-5.1",
     )
     release_unsettled = AsyncMock()
+    record_success = AsyncMock()
 
     async def settle_usage(
         settled_api_key: ApiKeyData | None,
         settled_reservation: proxy_service.ApiKeyUsageReservationData | None,
+        stream_settlement: proxy_service._StreamSettlement,
         *_args: object,
         **_kwargs: object,
     ) -> bool:
@@ -12596,9 +12606,10 @@ async def test_stream_with_retry_post_refresh_transient_exhaustion_fails_over(
         assert settled_reservation is reservation
         expected_settlement_account = account_c if replacement_outcome == "second_transient_exhaustion" else account_b
         assert stream_account_ids[-1] == expected_settlement_account.id
+        stream_settlement.usage_settlement_transferred = True
         settlement_wait_flags.append(bool(_kwargs.get("wait_for_settlement")))
         settlement_order.append("settle")
-        return True
+        return settlement_confirmed
 
     async def record_health(
         account: Account,
@@ -12625,6 +12636,7 @@ async def test_stream_with_retry_post_refresh_transient_exhaustion_fails_over(
     monkeypatch.setattr(service, "_release_unsettled_stream_api_key_usage", release_unsettled)
     monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(side_effect=lambda account, **_k: account))
     monkeypatch.setattr(service._load_balancer, "record_errors", record_errors)
+    monkeypatch.setattr(service._load_balancer, "record_success", record_success)
 
     async def select_account(_deadline: float, **kwargs: object) -> AccountSelection:
         excluded = set(cast(set[str], kwargs["exclude_account_ids"]))
@@ -12753,20 +12765,22 @@ async def test_stream_with_retry_post_refresh_transient_exhaustion_fails_over(
     transient_penalties = [
         call for call in handle_stream_error.await_args_list if call.args[2] == "invalid_request_error"
     ]
-    expected_penalty_accounts = [account_a]
-    if replacement_outcome == "second_transient_exhaustion":
+    expected_penalty_accounts = [account_a] if settlement_confirmed else []
+    if settlement_confirmed and replacement_outcome == "second_transient_exhaustion":
         expected_penalty_accounts.append(account_b)
     assert [call.args[0] for call in transient_penalties] == expected_penalty_accounts
     expected_health_codes = ["invalid_request_error"] * len(expected_penalty_accounts)
-    if replacement_outcome in ("surface", "visible_surface"):
+    if settlement_confirmed and replacement_outcome in ("surface", "visible_surface"):
         expected_health_codes.append("replacement_failed")
     ordered_terminal_effects = [entry for entry in settlement_order if entry != "health:invalid_api_key"]
     assert ordered_terminal_effects == ["settle"] + [f"health:{code}" for code in expected_health_codes]
     assert settlement_wait_flags == [True]
     assert stream_reservations == [reservation] * len(expected_account_ids)
     release_unsettled.assert_not_awaited()
-    expected_record_error_calls = [mock_call(account_a, 2)]
-    if replacement_outcome == "second_transient_exhaustion":
+    if not settlement_confirmed:
+        record_success.assert_not_awaited()
+    expected_record_error_calls = [mock_call(account_a, 2)] if settlement_confirmed else []
+    if settlement_confirmed and replacement_outcome == "second_transient_exhaustion":
         expected_record_error_calls.append(mock_call(account_b, 2))
     extra_retry_calls = [call for call in record_errors.await_args_list if call.args[1] == 2]
     assert extra_retry_calls == expected_record_error_calls
@@ -21396,6 +21410,189 @@ async def test_finalize_websocket_request_state_updates_balancer_state(monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallback_fails", "health_fails", "cancel_during"),
+    [
+        (False, False, None),
+        (True, False, None),
+        (False, True, None),
+        (False, False, "pre_start"),
+        (False, False, "primary"),
+        (False, False, "fallback"),
+    ],
+)
+async def test_finalize_websocket_health_waits_for_confirmed_settlement_fallback(
+    monkeypatch,
+    fallback_fails: bool,
+    health_fails: bool,
+    cancel_during: str | None,
+):
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    account = _make_account("acc_ws_settlement_fallback")
+    api_key = _make_api_key_data("key_ws_settlement_fallback")
+    reservation = proxy_service.ApiKeyUsageReservationData(
+        reservation_id="resv_ws_settlement_fallback",
+        key_id=api_key.id,
+        model="gpt-5.1",
+    )
+    fallback_started = asyncio.Event()
+    primary_started = asyncio.Event()
+    hold_primary = asyncio.Event()
+    release_fallback = asyncio.Event()
+    release_calls = 0
+    order: list[str] = []
+
+    class FakeApiKeysService:
+        def __init__(self, api_keys_repository: object) -> None:
+            del api_keys_repository
+
+        async def release_usage_reservation(self, reservation_id: str) -> None:
+            nonlocal release_calls
+            assert reservation_id == reservation.reservation_id
+            release_calls += 1
+            if cancel_during == "pre_start":
+                order.append("fallback_started")
+                fallback_started.set()
+                await release_fallback.wait()
+                order.append("fallback_committed")
+                return
+            if release_calls == 1:
+                if cancel_during == "primary":
+                    order.append("primary_started")
+                    primary_started.set()
+                    await hold_primary.wait()
+                order.append("primary_failed")
+                raise RuntimeError("primary settlement unavailable")
+            order.append("fallback_started")
+            fallback_started.set()
+            await release_fallback.wait()
+            if fallback_fails:
+                order.append("fallback_failed")
+                raise RuntimeError("fallback settlement unavailable")
+            order.append("fallback_committed")
+
+    async def record_health(*_args: object, **_kwargs: object) -> None:
+        order.append("health")
+        if health_fails:
+            raise RuntimeError("health persistence unavailable")
+
+    handle_stream_error = AsyncMock(side_effect=record_health)
+    monkeypatch.setattr(proxy_service, "ApiKeysService", FakeApiKeysService)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    if cancel_during == "pre_start":
+        original_track = service._track_stream_usage_settlement_task
+
+        def cancel_settlement_before_start(
+            task: asyncio.Task[bool],
+            *,
+            api_key: ApiKeyData,
+            api_key_reservation: proxy_service.ApiKeyUsageReservationData,
+            request_id: str,
+            release_on_failure: bool = True,
+        ) -> None:
+            original_track(
+                task,
+                api_key=api_key,
+                api_key_reservation=api_key_reservation,
+                request_id=request_id,
+                release_on_failure=release_on_failure,
+            )
+            task.cancel()
+
+        monkeypatch.setattr(service, "_track_stream_usage_settlement_task", cancel_settlement_before_start)
+
+    failed_payload: dict[str, JsonValue] = {
+        "type": "response.failed",
+        "response": {
+            "id": "resp_ws_settlement_fallback",
+            "error": {"code": "rate_limit_exceeded", "message": "slow down"},
+        },
+    }
+    failed_event = parse_sse_event(f"data: {json.dumps(failed_payload)}\n\n")
+    assert failed_event is not None
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_settlement_fallback",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=reservation,
+        started_at=time.monotonic(),
+        skip_request_log=True,
+    )
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+
+    finalizer = asyncio.create_task(
+        service._finalize_websocket_request_state(
+            request_state,
+            account=account,
+            account_id_value=account.id,
+            event=failed_event,
+            event_type="response.failed",
+            payload=failed_payload,
+            api_key=api_key,
+            upstream_control=upstream_control,
+            response_create_gate=asyncio.Semaphore(1),
+        )
+    )
+    if cancel_during == "primary":
+        await asyncio.wait_for(primary_started.wait(), timeout=1)
+        settlement_task = next(
+            task
+            for task in service._background_cleanup_tasks
+            if task.get_name() == "proxy-stream-api-key-settle-resp_ws_settlement_fallback"
+        )
+        settlement_task.cancel()
+    await asyncio.wait_for(fallback_started.wait(), timeout=1)
+    if cancel_during == "fallback":
+        settlement_task = next(
+            task
+            for task in service._background_cleanup_tasks
+            if task.get_name() == "proxy-stream-api-key-settle-resp_ws_settlement_fallback"
+        )
+        settlement_task.cancel()
+    await asyncio.sleep(0)
+    drain = asyncio.create_task(service.drain_persistence_tasks(timeout_seconds=1))
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(drain), timeout=0.05)
+    blocked_while_fallback_pending = not finalizer.done()
+    drain_blocked_while_fallback_pending = not drain.done()
+    health_writes_while_fallback_pending = handle_stream_error.await_count
+    reconnect_while_fallback_pending = upstream_control.reconnect_requested
+    retire_while_fallback_pending = upstream_control.retire_after_drain
+    release_fallback.set()
+    if health_fails:
+        with pytest.raises(RuntimeError, match="health persistence unavailable"):
+            await asyncio.wait_for(finalizer, timeout=1)
+    else:
+        await asyncio.wait_for(finalizer, timeout=1)
+    assert await asyncio.wait_for(drain, timeout=1) is True
+
+    assert blocked_while_fallback_pending is (cancel_during != "pre_start")
+    assert drain_blocked_while_fallback_pending is True
+    assert health_writes_while_fallback_pending == 0
+    assert reconnect_while_fallback_pending is True
+    assert retire_while_fallback_pending is True
+    assert release_calls == (1 if cancel_during == "pre_start" else 2)
+    assert upstream_control.reconnect_requested is True
+    assert upstream_control.retire_after_drain is True
+    if cancel_during == "pre_start":
+        assert order == ["fallback_started", "fallback_committed"]
+        handle_stream_error.assert_not_awaited()
+    elif cancel_during == "primary":
+        assert order == ["primary_started", "fallback_started", "fallback_committed"]
+        handle_stream_error.assert_not_awaited()
+    elif cancel_during == "fallback":
+        assert order == ["primary_failed", "fallback_started", "fallback_committed"]
+        handle_stream_error.assert_not_awaited()
+    elif fallback_fails:
+        assert order == ["primary_failed", "fallback_started", "fallback_failed"]
+        handle_stream_error.assert_not_awaited()
+    else:
+        assert order == ["primary_failed", "fallback_started", "fallback_committed", "health"]
+        handle_stream_error.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_finalize_websocket_empty_prewarm_does_not_store_continuity_anchor(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -24849,7 +25046,8 @@ async def test_stream_api_key_settlement_detaches_and_closes_repo(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_api_key_settlement_wait_option_blocks_until_finalized(monkeypatch):
+@pytest.mark.parametrize("cancel_caller", [False, True])
+async def test_stream_api_key_settlement_wait_option_blocks_until_finalized(monkeypatch, cancel_caller: bool):
     """Ordering-sensitive callers (websocket error path) opt into waiting so
     the settlement commits before load-balancer health writes."""
     started = asyncio.Event()
@@ -24913,6 +25111,9 @@ async def test_stream_api_key_settlement_wait_option_blocks_until_finalized(monk
     )
     await asyncio.wait_for(started.wait(), timeout=1)
     await asyncio.sleep(0)
+    if cancel_caller:
+        caller.cancel()
+        await asyncio.sleep(0)
     # Still blocked on the in-flight settlement.
     assert not caller.done()
     release.set()

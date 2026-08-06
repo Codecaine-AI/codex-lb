@@ -272,6 +272,10 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/e
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/ret2basic"><img src="https://avatars.githubusercontent.com/u/59381775?v=4?s=100" width="100px;" alt="ret2basic.eth"/><br /><sub><b>ret2basic.eth</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=ret2basic" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=ret2basic" title="Tests">⚠️</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/yeongjun-cigro"><img src="https://avatars.githubusercontent.com/u/260819931?v=4?s=100" width="100px;" alt="유영준"/><br /><sub><b>유영준</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=yeongjun-cigro" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=yeongjun-cigro" title="Tests">⚠️</a></td>
     </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/mrnaturalmonopoly-prog"><img src="https://avatars.githubusercontent.com/u/309156020?v=4?s=100" width="100px;" alt="mrnaturalmonopoly-prog"/><br /><sub><b>mrnaturalmonopoly-prog</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=mrnaturalmonopoly-prog" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=mrnaturalmonopoly-prog" title="Tests">⚠️</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/mrunnaturalmonopoly-svg"><img src="https://avatars.githubusercontent.com/u/308138851?v=4?s=100" width="100px;" alt="mrunnaturalmonopoly-svg"/><br /><sub><b>mrunnaturalmonopoly-svg</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=mrunnaturalmonopoly-svg" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=mrunnaturalmonopoly-svg" title="Tests">⚠️</a></td>
+    </tr>
   </tbody>
 </table>
 

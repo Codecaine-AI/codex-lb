@@ -45,6 +45,7 @@ from app.modules.proxy.load_balancer import (
     AccountSelection,
     CatalogOmissionQuotaAdmission,
 )
+from app.modules.proxy.sticky_repository import StickySessionsRepository
 from app.modules.usage.repository import AdditionalUsageRepository
 
 pytestmark = pytest.mark.integration
@@ -7709,6 +7710,304 @@ async def test_v1_responses_http_bridge_replays_full_resend_once_then_stays_on_n
         and call.get("fallback_on_preferred_account_unavailable") is False
     )
     assert owner_miss["preferred_account_is_continuity_owner"] is True
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_verified_full_resend_ignores_stale_broad_owner_on_durable_account(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    owner_account_id = await _import_account(
+        async_client,
+        "acc_backend_durable_full_resend_owner",
+        "backend-durable-full-resend-owner@example.com",
+    )
+    stale_account_id = await _import_account(
+        async_client,
+        "acc_backend_durable_full_resend_stale",
+        "backend-durable-full-resend-stale@example.com",
+    )
+    owner_account = await _get_account(owner_account_id)
+    stale_account = await _get_account(stale_account_id)
+    owner_chatgpt_account_id = cast(str, owner_account.chatgpt_account_id)
+    service = get_proxy_service_for_app(app_instance)
+    session_id = "backend-durable-full-resend-session"
+    historical_input: list[proxy_module.JsonValue] = [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first question"}],
+        }
+    ]
+    claimed = await service._durable_bridge.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value=session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        lease_ttl_seconds=60.0,
+        account_id=owner_account.id,
+        model="gpt-5.1",
+        service_tier=None,
+        latest_turn_state="http_turn_durable_full_resend",
+        latest_response_id="resp_durable_full_resend_previous",
+        allow_takeover=True,
+    )
+    renewed = await service._durable_bridge.renew_live_session(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        lease_ttl_seconds=60.0,
+        latest_turn_state="http_turn_durable_full_resend",
+        latest_response_id="resp_durable_full_resend_previous",
+        latest_input_item_count=len(historical_input),
+        latest_input_full_fingerprint=proxy_module._fingerprint_input_items(historical_input),
+    )
+    assert renewed is not None
+    released = await service._durable_bridge.release_live_session(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        draining=False,
+    )
+    assert released is not None
+    assert released.account_id == owner_account.id
+
+    async with SessionLocal() as session:
+        await StickySessionsRepository(session).upsert(
+            session_id,
+            stale_account.id,
+            kind=proxy_module.StickySessionKind.CODEX_SESSION,
+        )
+
+    upstream = _FakeBridgeUpstreamWebSocket("resp_durable_full_resend")
+    connect_calls: list[tuple[dict[str, str], str]] = []
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del access_token, base_url, session
+        connect_calls.append((dict(headers), account_id_header))
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    full_resend = [
+        *historical_input,
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "first answer"}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "second question"}],
+        },
+    ]
+    first_events = await _collect_sse_events(
+        async_client,
+        "/backend-api/codex/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": full_resend,
+            "stream": True,
+        },
+        headers={"session_id": session_id, "x-request-trace": "keep-me"},
+    )
+    second_events = await _collect_sse_events(
+        async_client,
+        "/backend-api/codex/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "third question",
+            "stream": True,
+        },
+        headers={"session_id": session_id},
+    )
+
+    _assert_created_text_delta_completed(first_events)
+    _assert_created_text_delta_completed(second_events)
+    assert connect_calls[0][1] == owner_chatgpt_account_id
+    assert len(connect_calls) == 1
+    connect_headers = {key.lower(): value for key, value in connect_calls[0][0].items()}
+    assert connect_headers["x-request-trace"] == "keep-me"
+    assert (
+        not {
+            "session_id",
+            "session-id",
+            "thread-id",
+            "x-codex-conversation-id",
+            "x-codex-session-id",
+            "x-codex-turn-state",
+        }
+        & connect_headers.keys()
+    )
+    assert len(upstream.sent_text) == 2
+    replay_payload = json.loads(upstream.sent_text[0])
+    assert "previous_response_id" not in replay_payload
+    assert replay_payload["input"] == full_resend
+    bridge_key = proxy_module._HTTPBridgeSessionKey("session_header", session_id, None)
+    bridge_session = service._http_bridge_sessions[bridge_key]
+    assert bridge_session.account.id == owner_account.id
+    assert bridge_session.codex_session is True
+    assert bridge_session.affinity.kind == proxy_module.StickySessionKind.CODEX_SESSION
+    assert bridge_session.affinity.key is None
+    async with SessionLocal() as session:
+        assert (
+            await StickySessionsRepository(session).get_account_id(
+                session_id,
+                kind=proxy_module.StickySessionKind.CODEX_SESSION,
+            )
+            == stale_account.id
+        )
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_verified_full_resend_fails_over_to_new_account_after_owner_loss(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    owner_account_id = await _import_account(
+        async_client,
+        "acc_backend_full_resend_failover_owner",
+        "backend-full-resend-failover-owner@example.com",
+    )
+    owner_account = await _get_account(owner_account_id)
+    owner_chatgpt_account_id = cast(str, owner_account.chatgpt_account_id)
+    owner_upstream = _ClosingBridgeUpstreamWebSocket("resp_failover_owner")
+    alternate_upstream = _FakeBridgeUpstreamWebSocket("resp_failover_alternate")
+    connected_account_ids: list[str] = []
+    connect_headers_by_account: dict[str, dict[str, str]] = {}
+    degraded_reasons: list[str] = []
+
+    async def fake_ensure_fresh_with_budget(self, account, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return account
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del access_token, base_url, session
+        connected_account_ids.append(account_id_header)
+        connect_headers_by_account[account_id_header] = dict(headers)
+        if account_id_header == owner_chatgpt_account_id:
+            return owner_upstream
+        return alternate_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+    monkeypatch.setattr(load_balancer_module, "set_degraded", degraded_reasons.append)
+
+    session_id = "backend-full-resend-failover-session"
+    historical_input: list[proxy_module.JsonValue] = [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first question"}],
+        }
+    ]
+    first_events = await _collect_sse_events(
+        async_client,
+        "/backend-api/codex/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": historical_input,
+            "stream": True,
+        },
+        headers={"session_id": session_id},
+    )
+    first_response = first_events[-1]["response"]
+    assert first_response["id"] == "resp_failover_owner_1"
+
+    service = get_proxy_service_for_app(app_instance)
+    durable_lookup = await service._durable_bridge.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value=session_id,
+        api_key_id=None,
+        turn_state=None,
+        session_header=session_id,
+        previous_response_id=None,
+    )
+    assert durable_lookup is not None
+    assert durable_lookup.account_id == owner_account.id
+    assert durable_lookup.latest_input_item_count == len(historical_input)
+    assert durable_lookup.latest_input_full_fingerprint is not None
+
+    alternate_account_id = await _import_account(
+        async_client,
+        "acc_backend_full_resend_failover_alternate",
+        "backend-full-resend-failover-alternate@example.com",
+    )
+    alternate_account = await _get_account(alternate_account_id)
+    alternate_chatgpt_account_id = cast(str, alternate_account.chatgpt_account_id)
+    pause = await async_client.post(f"/api/accounts/{owner_account_id}/pause")
+    assert pause.status_code == 200, pause.text
+
+    full_resend = [
+        *historical_input,
+        first_response["output"][0],
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "second question"}],
+        },
+    ]
+    second_events = await _collect_sse_events(
+        async_client,
+        "/backend-api/codex/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": full_resend,
+            "stream": True,
+        },
+        headers={"session_id": session_id, "x-request-trace": "keep-me"},
+    )
+    second_response = second_events[-1]["response"]
+    assert second_response["id"] == "resp_failover_alternate_1"
+
+    assert connected_account_ids == [owner_chatgpt_account_id, alternate_chatgpt_account_id]
+    alternate_connect_headers = {
+        key.lower(): value for key, value in connect_headers_by_account[alternate_chatgpt_account_id].items()
+    }
+    assert alternate_connect_headers["x-request-trace"] == "keep-me"
+    assert (
+        not {
+            "session_id",
+            "session-id",
+            "thread-id",
+            "x-codex-conversation-id",
+            "x-codex-session-id",
+            "x-codex-turn-state",
+        }
+        & alternate_connect_headers.keys()
+    )
+    assert len(owner_upstream.sent_text) == 1
+    assert len(alternate_upstream.sent_text) == 1
+    replay_payload = json.loads(alternate_upstream.sent_text[0])
+    assert "previous_response_id" not in replay_payload
+    assert replay_payload["input"] == full_resend
+    assert degraded_reasons == []
 
 
 @pytest.mark.asyncio

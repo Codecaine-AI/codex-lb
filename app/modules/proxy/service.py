@@ -575,6 +575,7 @@ from app.modules.proxy._service.support import (
     _request_log_useragent_fields,  # noqa: F401
     _RequestLogFailureMetadata,
     _RetryableStreamError,  # noqa: F401
+    _selection_api_key_fair_share_threshold_pct,
     _stream_settlement_error_payload,  # noqa: F401
     _StreamSettlement,  # noqa: F401
     _supported_optional_kwargs,  # noqa: F401
@@ -1793,6 +1794,10 @@ class ProxyService(
                     if lease_kind == "stream" and request_stage != "reattach"
                     else 0
                 )
+                api_key_fair_share_threshold_pct = _selection_api_key_fair_share_threshold_pct(
+                    settings, lease_kind=lease_kind, request_stage=request_stage
+                )
+                api_key_id = api_key.id if api_key is not None else None
                 required_preferred_account = (
                     preferred_account_id is not None and not fallback_on_preferred_account_unavailable
                 )
@@ -1898,6 +1903,8 @@ class ProxyService(
                         concurrency_caps=concurrency_caps,
                         redact_sensitive_details=redact_sensitive_details,
                         allow_usage_exhaustion_error=not required_preferred_account,
+                        api_key_id=api_key_id,
+                        api_key_stream_fair_share_threshold_pct=api_key_fair_share_threshold_pct,
                     )
                     if preferred_selection.account is not None:
                         logger.info(
@@ -1953,6 +1960,8 @@ class ProxyService(
                     traffic_class=effective_traffic_class,
                     concurrency_caps=concurrency_caps,
                     redact_sensitive_details=redact_sensitive_details,
+                    api_key_id=api_key_id,
+                    api_key_stream_fair_share_threshold_pct=api_key_fair_share_threshold_pct,
                 )
                 if selection.account is not None and selection.account.id in excluded_account_ids_set:
                     logger.warning(

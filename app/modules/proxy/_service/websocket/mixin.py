@@ -45,6 +45,7 @@ from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
     apply_codex_installation_headers,
     apply_codex_installation_metadata,
     filter_inbound_headers,
+    is_confirmed_pre_dispatch_transport_error,
     pop_compact_timeout_overrides,
     pop_stream_timeout_overrides,
     pop_transcribe_timeout_overrides,
@@ -3004,6 +3005,13 @@ class _WebSocketMixin:
     ) -> tuple[Account | None, UpstreamWebSocket | None]:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
+
+        async def _record_or_defer_confirmed_route_backoff(account: Account) -> None:
+            if request_state.api_key_reservation is not None:
+                request_state.deferred_account_error_backoffs.setdefault(account.id, account)
+                return
+            await proxy._load_balancer.record_error_backoff(account)
+
         if (
             request_state.useragent is None
             and request_state.useragent_group is None
@@ -3164,6 +3172,7 @@ class _WebSocketMixin:
                 last_failover_account = account
                 continue
             except ProxyResponseError as exc:
+                confirmed_pre_dispatch = is_confirmed_pre_dispatch_transport_error(exc)
                 if selected_account_model_replacement:
                     # The account/model retry budget selected this replacement;
                     # its connection failure must be surfaced rather than
@@ -3177,9 +3186,16 @@ class _WebSocketMixin:
                         attempt=attempt + 1,
                         max_attempts=max_attempts,
                         deterministic_failover_enabled=getattr(base_settings, "deterministic_failover_enabled", True),
+                        require_preferred_account=require_preferred_account,
                     )
                 if action == "failover_next":
+                    # Release the dead route's stream lease before recording
+                    # the backoff so its concurrency slot never outlives the
+                    # failed connection attempt.
                     await proxy._load_balancer.release_account_lease(selected_stream_lease)
+                    selected_stream_lease = None
+                    if confirmed_pre_dispatch:
+                        await _record_or_defer_confirmed_route_backoff(account)
                     last_failover_exc = exc
                     last_failover_account = account
                     excluded_account_ids.add(account.id)
@@ -3189,6 +3205,8 @@ class _WebSocketMixin:
                 error_message = error.message if error else None
                 await proxy._load_balancer.release_account_lease(selected_stream_lease)
                 selected_stream_lease = None
+                if confirmed_pre_dispatch:
+                    await _record_or_defer_confirmed_route_backoff(account)
                 await proxy._emit_websocket_connect_failure(
                     websocket,
                     client_send_lock=client_send_lock,
@@ -3902,13 +3920,25 @@ class _WebSocketMixin:
         attempt: int,
         max_attempts: int,
         deterministic_failover_enabled: bool,
+        require_preferred_account: bool = False,
     ) -> str:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
-        classified = await proxy._handle_websocket_connect_error(account, exc)
-        failure_class = classified["failure_class"] if isinstance(classified, dict) else "non_retryable"
+        confirmed_pre_dispatch = is_confirmed_pre_dispatch_transport_error(exc)
+        if confirmed_pre_dispatch:
+            # A proven pre-dispatch proxy connect failure is account-local
+            # transient evidence. The caller applies the bounded transient
+            # backoff floor once the failed lease is released, so the generic
+            # single-error health write is skipped here. Hard account
+            # ownership fails closed on the original sanitized failure.
+            failure_class = "retryable_transient"
+        else:
+            classified = await proxy._handle_websocket_connect_error(account, exc)
+            failure_class = classified["failure_class"] if isinstance(classified, dict) else "non_retryable"
         candidates_remaining = max_attempts - attempt
-        if exc.status_code == 401 and candidates_remaining > 0:
+        if confirmed_pre_dispatch:
+            action = "surface" if require_preferred_account or candidates_remaining <= 0 else "failover_next"
+        elif exc.status_code == 401 and candidates_remaining > 0:
             action = "failover_next"
         elif deterministic_failover_enabled:
             action = failover_decision(
@@ -5371,8 +5401,7 @@ class _WebSocketMixin:
 
         if request_state.draining_until_terminal:
             await _release_websocket_response_create_gate(request_state, response_create_gate)
-            await proxy._release_websocket_reservation(request_state.api_key_reservation)
-            request_state.api_key_reservation = None
+            await proxy._release_websocket_request_state_reservation(request_state)
             # The reservation is settled; clear any terminal-bookkeeping
             # settlement claim so abort handling does not settle it again.
             request_state.terminal_settlement_phase = None
@@ -5466,6 +5495,7 @@ class _WebSocketMixin:
             # persistence. The health write remains ordered below.
             upstream_control.reconnect_requested = True
             upstream_control.retire_after_drain = True
+        lifecycle = request_state.deferred_account_backoff_lifecycle
         settlement_committed = await proxy._settle_stream_api_key_usage(
             api_key,
             request_state.api_key_reservation,
@@ -5473,13 +5503,27 @@ class _WebSocketMixin:
             response_id,
             # The reservation must be settled before the load-balancer
             # health write below (settlement-ordering invariant).
-            wait_for_settlement=settlement.account_health_error or settlement.record_success,
+            wait_for_settlement=(
+                lifecycle is not None
+                or settlement.account_health_error
+                or settlement.record_success
+                or bool(request_state.deferred_account_error_backoffs)
+            ),
         )
         # Settlement responsibility has transferred (the settle path tracks
         # its own failure/cancellation fallback release). Clear any terminal-
         # bookkeeping settlement claim so a later abort of the surrounding
         # continuation does not race a duplicate release against it.
         request_state.terminal_settlement_phase = None
+        if settlement_committed:
+            request_state.api_key_reservation = None
+            if lifecycle is not None:
+                lifecycle.settlement_confirmed = True
+            pending_backoffs = (
+                lifecycle.pending_backoffs if lifecycle is not None else request_state.deferred_account_error_backoffs
+            )
+            if pending_backoffs:
+                await proxy._drain_deferred_account_error_backoffs(pending_backoffs)
         latency_ms = int((time.monotonic() - request_state.started_at) * 1000)
         cached_input_tokens = usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
         reasoning_tokens = (

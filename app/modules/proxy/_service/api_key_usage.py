@@ -420,7 +420,7 @@ class _ApiKeyUsageMixin:
             release_on_failure=not wait_for_settlement,
         )
         if wait_for_settlement:
-            # Ordering-sensitive callers (the websocket error path) must
+            # Ordering-sensitive callers (websocket account-health paths) must
             # commit the settlement before load-balancer health writes; they
             # opt into waiting while everything else stays detached.
             settlement_committed = False

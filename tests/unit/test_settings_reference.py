@@ -61,7 +61,11 @@ ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 # decision — operators who don't use the reset-credit surface shed the
 # per-replica authenticated upstream polling; default true keeps current
 # zero-config behavior and the interval setting alone cannot express "off".
-MAX_SETTINGS_FIELDS = 127
+# 127 -> 129: telemetry_enabled + telemetry_endpoint (anonymous telemetry,
+# #1618). telemetry_enabled has no hardcoded default because tri-state None
+# drives the informed-consent dialog; the endpoint stays settable so
+# self-hosters can point at their own collector or air-gap it.
+MAX_SETTINGS_FIELDS = 129
 
 
 def test_generated_settings_reference_matches_code() -> None:

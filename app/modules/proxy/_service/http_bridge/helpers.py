@@ -69,7 +69,6 @@ from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
     AccountStatus,
     DashboardSettings,
-    HttpBridgeSessionState,
     StickySessionKind,
 )
 from app.modules.api_keys.service import (
@@ -1575,15 +1574,19 @@ def _durable_bridge_lookup_allows_local_reuse(
 
 
 def _http_bridge_allow_durable_takeover(lookup: DurableBridgeLookup | None) -> bool:
-    owner_instance = _durable_bridge_lookup_active_owner(lookup)
-    if owner_instance is None:
+    return _http_bridge_durable_lookup_allows_turn_state_takeover(lookup)
+
+
+def _http_bridge_claim_allows_takeover(
+    lookup: DurableBridgeLookup | None,
+    *,
+    force: bool,
+) -> bool:
+    if _http_bridge_allow_durable_takeover(lookup):
         return True
-    if lookup is None:
+    if not force:
         return False
-    return lookup.state in {
-        HttpBridgeSessionState.DRAINING,
-        HttpBridgeSessionState.CLOSED,
-    }
+    return lookup is None or lookup.state != "draining"
 
 
 def _http_bridge_has_durable_recovery_anchor(
@@ -2706,6 +2709,7 @@ for _helper_name in (
     "_durable_bridge_lookup_active_owner",
     "_durable_bridge_lookup_allows_local_reuse",
     "_http_bridge_allow_durable_takeover",
+    "_http_bridge_claim_allows_takeover",
     "_http_bridge_has_durable_recovery_anchor",
     "_http_bridge_can_local_recover_without_ring",
     "_http_bridge_can_single_instance_owner_takeover_without_anchor",

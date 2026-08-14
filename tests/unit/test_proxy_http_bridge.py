@@ -59,6 +59,7 @@ from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeAliasRegistration,
     DurableBridgeAliasRegistrationReceipt,
 )
+from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_epoch
 from app.modules.proxy.http_bridge_forwarding import OwnerForwardRelayFailure
 from app.modules.proxy.load_balancer import CONTINUITY_OWNER_UNAVAILABLE, CatalogOmissionQuotaAdmission
 
@@ -17526,7 +17527,7 @@ async def test_get_or_create_http_bridge_session_late_owner_after_inflight_evict
     assert owner_exc_info.value.status_code == 429
     assert owner_exc_info.value.payload["error"]["code"] == "capacity_exhausted_active_sessions"
     assert key not in service._http_bridge_sessions
-    close_http_bridge_session.assert_awaited_once_with(created)
+    close_http_bridge_session.assert_awaited_once_with(created, release_durable_session=True)
 
 
 @pytest.mark.asyncio
@@ -17638,7 +17639,7 @@ async def test_recovery_session_is_not_published_when_durable_tables_are_missing
     assert exc_info.value.status_code == 502
     assert exc_info.value.payload["error"]["code"] == "upstream_unavailable"
     assert key not in service._http_bridge_sessions
-    close_http_bridge_session.assert_awaited_once_with(created_session)
+    close_http_bridge_session.assert_awaited_once_with(created_session, release_durable_session=True)
 
 
 @pytest.mark.asyncio
@@ -27061,3 +27062,366 @@ async def test_heartbeat_maintenance_tolerates_a_missing_service_or_pass() -> No
 
     await run_http_bridge_heartbeat_maintenance(None)
     await run_http_bridge_heartbeat_maintenance(SimpleNamespace())
+
+
+@pytest.mark.asyncio
+async def test_rejected_creator_does_not_release_the_registered_winners_durable_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1695: after an inflight evict, a replacement can register while
+    the stale creator is still claiming. The stale creator claims LAST, so its
+    epoch is current and its fenced release would succeed — closing the durable
+    row out from under the session that actually won the registry. A rejected
+    creator must not release a row that now belongs to someone else."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey("turn_state_header", "sid-rejected-creator", None)
+    settings = _make_app_settings()
+    settings.proxy_admission_wait_timeout_seconds = 0.01
+    stale_creator_session = _make_bridge_session(key_value="sid-rejected-creator")
+    stale_creator_session.key = key
+    registered_winner = _make_bridge_session(key_value="sid-rejected-creator-winner")
+    registered_winner.key = key
+    create_started = asyncio.Event()
+    finish_create = asyncio.Event()
+
+    async def create_session(*_: object, **__: object) -> proxy_service._HTTPBridgeSession:
+        create_started.set()
+        await finish_create.wait()
+        return stale_creator_session
+
+    monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", Mock(return_value=[]))
+    monkeypatch.setattr(service, "_create_http_bridge_session", create_session)
+    claim_durable_session = AsyncMock()
+    monkeypatch.setattr(service, "_claim_durable_http_bridge_session", claim_durable_session)
+    close_http_bridge_session = AsyncMock()
+    monkeypatch.setattr(service, "_close_http_bridge_session", close_http_bridge_session)
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_service, "_http_bridge_should_wait_for_registration", AsyncMock(return_value=False))
+    monkeypatch.setattr(proxy_service, "_http_bridge_owner_instance", AsyncMock(return_value="instance-a"))
+    monkeypatch.setattr(
+        proxy_service,
+        "_active_http_bridge_instance_ring",
+        AsyncMock(return_value=("instance-a", ("instance-a",))),
+    )
+
+    async def get_session() -> proxy_service._HTTPBridgeSession | proxy_service._HTTPBridgeOwnerForward:
+        return await service._get_or_create_http_bridge_session(
+            key,
+            headers={"x-codex-turn-state": "sid-rejected-creator"},
+            affinity=proxy_service._AffinityPolicy(
+                key="sid-rejected-creator",
+                kind=proxy_service.StickySessionKind.CODEX_SESSION,
+            ),
+            api_key=None,
+            request_model="gpt-5.4",
+            idle_ttl_seconds=120.0,
+            max_sessions=8,
+        )
+
+    owner_task = asyncio.create_task(get_session())
+    await asyncio.wait_for(create_started.wait(), timeout=1.0)
+
+    # The waiter times out and evicts the inflight future; a replacement then
+    # wins the registry slot while the stale creator is still in flight.
+    with pytest.raises(ProxyResponseError):
+        await asyncio.wait_for(get_session(), timeout=1.0)
+    async with service._http_bridge_lock:
+        service._http_bridge_sessions[key] = registered_winner
+
+    finish_create.set()
+    with pytest.raises(ProxyResponseError):
+        await asyncio.wait_for(owner_task, timeout=1.0)
+
+    # The winner keeps the registry slot, and the rejected creator closed its
+    # own session WITHOUT releasing the durable row the winner now owns.
+    assert service._http_bridge_sessions[key] is registered_winner
+    close_http_bridge_session.assert_awaited_once_with(stale_creator_session, release_durable_session=False)
+    # It never claimed at all: claiming would have advanced the durable epoch
+    # past the registered winner, fencing the winner's own renewals out of a
+    # row it legitimately owns.
+    claim_durable_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_superseded_creator_hands_its_claimed_epoch_to_the_registered_winner() -> None:
+    """Eviction can land DURING the claim, so a creator may advance the shared
+    row's epoch past the session that won the registry slot — fencing the
+    winner's own renewals out of a row it owns. Both sessions belong to this
+    instance and point at the same row, so the epoch is handed over rather
+    than stranded (issue #1695)."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey("turn_state_header", "sid-handover", None)
+    winner = _make_bridge_session(key_value="sid-handover-winner")
+    winner.key = key
+    winner.durable_session_id = "durable-shared"
+    winner.durable_owner_epoch = 4
+    superseded_creator = _make_bridge_session(key_value="sid-handover-stale")
+    superseded_creator.key = key
+    superseded_creator.durable_session_id = "durable-shared"
+    superseded_creator.durable_owner_epoch = 5
+    service._http_bridge_sessions[key] = winner
+
+    superseded = await http_bridge_helpers_module._settle_failed_http_bridge_creation(
+        service,
+        key,
+        inflight_future=None,
+        created_session=superseded_creator,
+        exc=RuntimeError("registration lost"),
+    )
+
+    assert superseded is True
+    assert winner.durable_owner_epoch == 5
+
+
+@pytest.mark.asyncio
+async def test_settle_failed_creation_leaves_an_unrelated_winner_epoch_alone() -> None:
+    """The handover applies only when both sessions point at the same durable
+    row and the creator's epoch is genuinely newer."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey("turn_state_header", "sid-handover-other", None)
+    winner = _make_bridge_session(key_value="sid-handover-other-winner")
+    winner.key = key
+    winner.durable_session_id = "durable-winner-row"
+    winner.durable_owner_epoch = 9
+    creator = _make_bridge_session(key_value="sid-handover-other-stale")
+    creator.key = key
+    creator.durable_session_id = "durable-different-row"
+    creator.durable_owner_epoch = 12
+    service._http_bridge_sessions[key] = winner
+
+    assert (
+        await http_bridge_helpers_module._settle_failed_http_bridge_creation(
+            service,
+            key,
+            inflight_future=None,
+            created_session=creator,
+            exc=RuntimeError("registration lost"),
+        )
+        is True
+    )
+    assert winner.durable_owner_epoch == 9
+
+
+@pytest.mark.asyncio
+async def test_renew_adopts_a_same_instance_epoch_advance_for_the_registered_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A creator superseded mid-claim advances the row's epoch under this
+    instance. The session still holding the registry slot legitimately owns the
+    key, so its renewal must adopt the epoch — evicting would 409 the owner
+    (issue #1695)."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    registered = _make_bridge_session(key_value="sid-adopt")
+    registered.durable_session_id = "durable-adopt"
+    registered.durable_owner_epoch = 3
+    service._http_bridge_sessions[registered.key] = registered
+    renew_live_session = AsyncMock(
+        return_value=SimpleNamespace(
+            owner_instance_id=_make_app_settings().http_responses_session_bridge_instance_id,
+            owner_process_epoch=http_bridge_owner_process_epoch(),
+            owner_epoch=4,
+            account_id="acc-bridge",
+            session_id="durable-adopt",
+        )
+    )
+    monkeypatch.setattr(service, "_durable_bridge", SimpleNamespace(renew_live_session=renew_live_session))
+    schedule_closes = Mock()
+    monkeypatch.setattr(service, "_schedule_http_bridge_session_closes", schedule_closes)
+
+    await http_bridge_helpers_module._renew_durable_http_bridge_lease(service, registered)
+
+    assert registered.durable_owner_epoch == 4
+    assert registered.closed is False
+    assert service._http_bridge_sessions[registered.key] is registered
+    schedule_closes.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_renew_still_evicts_when_another_local_session_holds_the_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session that lost the registry slot to a different local session is a
+    genuine ownership loss and must still be evicted with the 409 contract."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    loser = _make_bridge_session(key_value="sid-evict")
+    loser.durable_session_id = "durable-evict"
+    loser.durable_owner_epoch = 3
+    winner = _make_bridge_session(key_value="sid-evict-winner")
+    winner.key = loser.key
+    service._http_bridge_sessions[loser.key] = winner
+    renew_live_session = AsyncMock(
+        return_value=SimpleNamespace(
+            owner_instance_id=_make_app_settings().http_responses_session_bridge_instance_id,
+            owner_process_epoch=http_bridge_owner_process_epoch(),
+            owner_epoch=4,
+            account_id="acc-bridge",
+            session_id="durable-evict",
+        )
+    )
+    monkeypatch.setattr(service, "_durable_bridge", SimpleNamespace(renew_live_session=renew_live_session))
+    monkeypatch.setattr(service, "_schedule_http_bridge_session_closes", Mock())
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await http_bridge_helpers_module._renew_durable_http_bridge_lease(service, loser)
+
+    assert exc_info.value.status_code == 409
+    assert loser.durable_owner_epoch == 3
+    assert loser.closed is True
+
+
+@pytest.mark.asyncio
+async def test_settle_failed_creation_spares_a_replacement_that_has_not_registered_yet() -> None:
+    """A replacement that has claimed but not yet published its session is as
+    much the winner as a registered one: releasing here would close the row
+    beneath it, and it would then register with an older epoch and be fenced
+    out on its first renewal (issue #1695)."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey("turn_state_header", "sid-inflight-winner", None)
+    stale_creator = _make_bridge_session(key_value="sid-inflight-stale")
+    stale_creator.key = key
+    stale_creator.durable_session_id = "durable-inflight"
+    stale_creator.durable_owner_epoch = 6
+    replacement_future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    service._http_bridge_inflight_sessions[key] = replacement_future
+
+    superseded = await http_bridge_helpers_module._settle_failed_http_bridge_creation(
+        service,
+        key,
+        inflight_future=None,
+        created_session=stale_creator,
+        exc=RuntimeError("registration lost"),
+    )
+
+    # No session is registered yet, but the replacement owns the inflight slot.
+    assert service._http_bridge_sessions.get(key) is None
+    assert superseded is True
+    # The replacement's future is left intact for it to resolve.
+    assert service._http_bridge_inflight_sessions.get(key) is replacement_future
+    replacement_future.cancel()
+
+
+@pytest.mark.asyncio
+async def test_settle_failed_creation_releases_when_nothing_replaced_it() -> None:
+    """With no registered session and no in-flight replacement, the creator
+    still owns the row and must release it rather than leak it."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey("turn_state_header", "sid-sole-creator", None)
+    sole_creator = _make_bridge_session(key_value="sid-sole-creator")
+    sole_creator.key = key
+    sole_creator.durable_session_id = "durable-sole"
+    sole_creator.durable_owner_epoch = 2
+
+    superseded = await http_bridge_helpers_module._settle_failed_http_bridge_creation(
+        service,
+        key,
+        inflight_future=None,
+        created_session=sole_creator,
+        exc=RuntimeError("upstream failed"),
+    )
+
+    assert superseded is False
+
+
+@pytest.mark.asyncio
+async def test_renew_evicts_when_a_newer_process_incarnation_advanced_the_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two incarnations can share a configured instance ID across a graceful
+    restart. The successor process's claim must still fence the predecessor
+    out, so adoption requires a matching process epoch, not just the instance
+    ID (issue #1695)."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    old_process_session = _make_bridge_session(key_value="sid-restart")
+    old_process_session.durable_session_id = "durable-restart"
+    old_process_session.durable_owner_epoch = 3
+    service._http_bridge_sessions[old_process_session.key] = old_process_session
+    renew_live_session = AsyncMock(
+        return_value=SimpleNamespace(
+            owner_instance_id=_make_app_settings().http_responses_session_bridge_instance_id,
+            # Same instance ID, different incarnation.
+            owner_process_epoch="successor-process-epoch",
+            owner_epoch=4,
+            account_id="acc-bridge",
+            session_id="durable-restart",
+        )
+    )
+    monkeypatch.setattr(service, "_durable_bridge", SimpleNamespace(renew_live_session=renew_live_session))
+    monkeypatch.setattr(service, "_schedule_http_bridge_session_closes", Mock())
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await http_bridge_helpers_module._renew_durable_http_bridge_lease(service, old_process_session)
+
+    assert exc_info.value.status_code == 409
+    assert old_process_session.durable_owner_epoch == 3
+    assert old_process_session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_renew_does_not_adopt_an_epoch_advance_that_moved_the_row_to_another_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claim rewrites the row's account_id and clears continuity aliases, so
+    an advance that moved the row to another account is a real ownership change
+    for this session — adopting would keep it dispatching on a row bound to a
+    different account (issue #1695)."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    session = _make_bridge_session(key_value="sid-account-moved")
+    session.durable_session_id = "durable-account-moved"
+    session.durable_owner_epoch = 3
+    service._http_bridge_sessions[session.key] = session
+    renew_live_session = AsyncMock(
+        return_value=SimpleNamespace(
+            owner_instance_id=_make_app_settings().http_responses_session_bridge_instance_id,
+            owner_process_epoch=http_bridge_owner_process_epoch(),
+            owner_epoch=4,
+            account_id="acc-other",
+            session_id="durable-account-moved",
+        )
+    )
+    monkeypatch.setattr(service, "_durable_bridge", SimpleNamespace(renew_live_session=renew_live_session))
+    monkeypatch.setattr(service, "_schedule_http_bridge_session_closes", Mock())
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await http_bridge_helpers_module._renew_durable_http_bridge_lease(service, session)
+
+    assert exc_info.value.status_code == 409
+    assert session.durable_owner_epoch == 3
+    assert session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_settle_failed_creation_releases_a_row_rebound_away_from_the_winner() -> None:
+    """A winner on a different account no longer shares this row: the claim
+    already rewrote its account binding and cleared its continuity aliases.
+    The epoch is not handed over, and the row IS released so the winner is
+    fenced promptly instead of dispatching against a row bound elsewhere."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey("turn_state_header", "sid-account-handover", None)
+    winner = _make_bridge_session(key_value="sid-account-handover-winner")
+    winner.key = key
+    winner.durable_session_id = "durable-account-handover"
+    winner.durable_owner_epoch = 4
+    winner.account = cast(Any, SimpleNamespace(id="acc-winner", status=AccountStatus.ACTIVE, plan_type="plus"))
+    stale_creator = _make_bridge_session(key_value="sid-account-handover-stale")
+    stale_creator.key = key
+    stale_creator.durable_session_id = "durable-account-handover"
+    stale_creator.durable_owner_epoch = 5
+    stale_creator.account = cast(Any, SimpleNamespace(id="acc-stale", status=AccountStatus.ACTIVE, plan_type="plus"))
+    service._http_bridge_sessions[key] = winner
+
+    superseded = await http_bridge_helpers_module._settle_failed_http_bridge_creation(
+        service,
+        key,
+        inflight_future=None,
+        created_session=stale_creator,
+        exc=RuntimeError("registration lost"),
+    )
+
+    # Not treated as superseded: the row is ours to release, and the winner
+    # will be fenced on its next renewal and retry cleanly.
+    assert superseded is False
+    assert winner.durable_owner_epoch == 4

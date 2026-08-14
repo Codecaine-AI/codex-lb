@@ -15,6 +15,7 @@ from app.core.metrics.prometheus import (
 )
 from app.db.models import StickySessionKind
 from app.modules.proxy._service.http_bridge.helpers import (
+    _http_bridge_allow_durable_takeover,
     _http_bridge_durable_lease_ttl_seconds,
     _http_bridge_live_previous_response_alias_owner,
     _http_bridge_live_turn_state_alias_owner,
@@ -448,6 +449,7 @@ class _HTTPBridgeSessionRegistryMixin:
         force_owner_epoch_advance: bool = False,
         claim_account_id: str | None = None,
         clear_latest_turn_state: bool = False,
+        record_restart_takeover: bool = False,
     ) -> None:
         current_instance = _service_get_settings().http_responses_session_bridge_instance_id
         current_process_epoch = http_bridge_owner_process_epoch()
@@ -472,6 +474,13 @@ class _HTTPBridgeSessionRegistryMixin:
                 if lookup.owner_instance_id == current_instance:
                     break
                 if not allow_takeover or claim_attempt > 0:
+                    break
+                if not _http_bridge_allow_durable_takeover(lookup):
+                    # The claim reported a live foreign owner: we lost the race
+                    # rather than hitting transient contention. The repository
+                    # already dropped its takeover permission for that reason,
+                    # and retrying here with a fresh call would restore it and
+                    # steal the winner's live lease (issue #1695).
                     break
                 await asyncio.sleep(0)
             assert lookup is not None
@@ -505,7 +514,7 @@ class _HTTPBridgeSessionRegistryMixin:
             if (
                 PROMETHEUS_AVAILABLE
                 and bridge_durable_recover_total is not None
-                and allow_takeover
+                and record_restart_takeover
                 and lookup.owner_epoch > 1
             ):
                 bridge_durable_recover_total.labels(path="restart_takeover").inc()

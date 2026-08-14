@@ -74,6 +74,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _durable_bridge_lookup_allows_local_reuse,
     _forwarded_http_bridge_session_key,
     _http_bridge_alias_target_is_stale,
+    _http_bridge_allow_durable_takeover,
     _http_bridge_can_local_recover_without_ring,
     _http_bridge_can_recover_during_drain,
     _http_bridge_can_single_instance_owner_takeover_without_anchor,
@@ -112,12 +113,14 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _mark_http_bridge_reader_handoff_reconnect_failed,
     _persist_http_bridge_replacement_account,
     _preferred_http_bridge_reconnect_turn_state,
+    _raise_if_http_bridge_creation_superseded,
     _record_bridge_drain_recovery_allowed,
     _record_bridge_first_turn_timeout,
     _refresh_reused_http_bridge_session_with_handoff,
     _register_http_bridge_turn_state_aliases_locked,
     _require_http_bridge_bound_account_not_excluded,
     _reserve_http_bridge_unanchored_handoff,
+    _settle_failed_http_bridge_creation,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _close_http_bridge_session as _helpers_close_http_bridge_session,
@@ -1524,6 +1527,7 @@ class _HTTPBridgeMixin(
                         if optional_kwarg not in create_signature.parameters:
                             create_kwargs.pop(optional_kwarg, None)
                 created_session = await create_session(key, **create_kwargs)
+                await _raise_if_http_bridge_creation_superseded(self, key, inflight_future=inflight_future)
                 await self._claim_durable_http_bridge_session(
                     created_session,
                     allow_takeover=_http_bridge_claim_allows_takeover(
@@ -1531,6 +1535,14 @@ class _HTTPBridgeMixin(
                         force=force_durable_takeover,
                     ),
                     force_owner_epoch_advance=force_durable_takeover,
+                    # restart_takeover means recovering a row whose previous
+                    # owner is genuinely gone. Every claim now advances the
+                    # epoch, so epoch > 1 alone would also count ordinary
+                    # local successor claims (no pre-claim lookup, or a
+                    # forced replace of a live local session).
+                    record_restart_takeover=(
+                        durable_lookup is not None and _http_bridge_allow_durable_takeover(durable_lookup)
+                    ),
                 )
                 async with self._http_bridge_lock:
                     current_future = self._http_bridge_inflight_sessions.get(key)
@@ -1548,18 +1560,18 @@ class _HTTPBridgeMixin(
                         code="capacity_exhausted_active_sessions",
                     )
             except BaseException as exc:
-                async with self._http_bridge_lock:
-                    current_future = self._http_bridge_inflight_sessions.get(key)
-                    if current_future is inflight_future:
-                        self._http_bridge_inflight_sessions.pop(key, None)
-                        if inflight_future is not None and not inflight_future.done():
-                            if isinstance(exc, asyncio.CancelledError):
-                                inflight_future.cancel()
-                            else:
-                                inflight_future.set_exception(exc)
-                                inflight_future.exception()
+                superseded = await _settle_failed_http_bridge_creation(
+                    self,
+                    key,
+                    inflight_future=inflight_future,
+                    created_session=created_session,
+                    exc=exc,
+                )
                 if created_session is not None and not session_registered:
-                    await self._close_http_bridge_session(created_session)
+                    await self._close_http_bridge_session(
+                        created_session,
+                        release_durable_session=not superseded,
+                    )
                 raise
             assert created_session is not None
             _log_http_bridge_event(

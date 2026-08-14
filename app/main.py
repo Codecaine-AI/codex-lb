@@ -46,6 +46,7 @@ from app.core.middleware import (
     add_request_body_limit_middleware,
     add_request_decompression_middleware,
     add_request_id_middleware,
+    add_required_capability_http_middleware,
     add_trusted_proxy_headers_middleware,
 )
 from app.core.middleware.dashboard_gzip import add_dashboard_gzip_middleware
@@ -769,6 +770,7 @@ def create_app() -> FastAPI:
     add_request_decompression_middleware(app)
     add_request_body_limit_middleware(app)
     add_multipart_content_encoding_middleware(app)
+    add_required_capability_http_middleware(app)
     add_request_id_middleware(app)
     add_api_firewall_middleware(app)
     app.add_middleware(cast(Any, MetricsMiddleware), enabled=settings.metrics_enabled)

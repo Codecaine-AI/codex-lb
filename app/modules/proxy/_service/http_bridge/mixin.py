@@ -96,6 +96,8 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_parallel_fork_key,
     _http_bridge_previous_response_alias_key,
     _http_bridge_previous_response_owner_unavailable_error,
+    _http_bridge_reconnect_connect_failure,
+    _http_bridge_reconnect_selection_failure,
     _http_bridge_request_budget_seconds,
     _http_bridge_request_needs_unanchored_handoff,
     _http_bridge_session_account_active,
@@ -210,12 +212,11 @@ from app.modules.proxy.affinity import (
 )
 from app.modules.proxy.continuity import (
     is_http_bridge_account_neutral_replay,
+    resolve_reconnect_preferred_account_id,
     resolve_required_account_id,
     without_http_bridge_session_affinity_headers,
 )
-from app.modules.proxy.durable_bridge_coordinator import (
-    DurableBridgeLookup,
-)
+from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
 from app.modules.proxy.load_balancer import CONTINUITY_OWNER_UNAVAILABLE, AccountLease
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
@@ -2044,8 +2045,8 @@ class _HTTPBridgeMixin(
             session.api_key = request_state.api_key
             forced_refresh_account_id = request_state.force_refresh_account_id
             excluded_account_ids: set[str] = set(request_state.excluded_account_ids)
-            requested_preferred_account_id = (
-                request_state.preferred_account_id if require_preferred_account or account_neutral_recovery else None
+            requested_preferred_account_id = resolve_reconnect_preferred_account_id(
+                request_state, session.account.id, require_preferred_account, account_neutral_recovery
             )
             required_preferred_account_id = resolve_required_account_id(
                 ("requested reconnect owner", requested_preferred_account_id),
@@ -2244,9 +2245,8 @@ class _HTTPBridgeMixin(
                         preferred_candidate_id = None
                     continue
                 record_selected_account_takeover(None)
-                status_code, error_payload = selection_failure_response(selection)
                 complete_failed_handoff()
-                raise ProxyResponseError(status_code, error_payload)
+                raise _http_bridge_reconnect_selection_failure(selection, required_preferred_account_id)
             if required_preferred_account_id is not None and account.id != required_preferred_account_id:
                 if selection.lease is not None:
                     selected_account_lease = selection.lease
@@ -2291,7 +2291,7 @@ class _HTTPBridgeMixin(
                 if exc.status_code != 401 or _remaining_budget_seconds(deadline) <= 0:
                     await release_selected_account_lease()
                     complete_failed_handoff()
-                    raise
+                    raise _http_bridge_reconnect_connect_failure(exc, required_preferred_account_id) from exc
                 try:
                     account = await self._ensure_fresh_with_budget(
                         account,
@@ -2314,7 +2314,7 @@ class _HTTPBridgeMixin(
                     if retry_exc.status_code != 401:
                         await release_selected_account_lease()
                         complete_failed_handoff()
-                        raise
+                        raise _http_bridge_reconnect_connect_failure(retry_exc, required_preferred_account_id)
                     await self._handle_proxy_error(account, retry_exc)
                     await abandon_selected_account_retry(account)
                     continue
@@ -2335,8 +2335,8 @@ class _HTTPBridgeMixin(
                     continue
                 await release_selected_account_lease()
                 complete_failed_handoff()
-                raise
-            except (aiohttp.ClientError, asyncio.TimeoutError):
+                raise _http_bridge_reconnect_connect_failure(exc, required_preferred_account_id)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as transport_exc:
                 if selected_is_preferred and _remaining_budget_seconds(deadline) > 0:
                     if retry_same_account_once:
                         retry_same_account_once = False
@@ -2346,7 +2346,7 @@ class _HTTPBridgeMixin(
                     continue
                 await release_selected_account_lease()
                 complete_failed_handoff()
-                raise
+                raise _http_bridge_reconnect_connect_failure(transport_exc, required_preferred_account_id)
             except asyncio.CancelledError:
                 session.closed = True
                 await release_selected_account_lease()

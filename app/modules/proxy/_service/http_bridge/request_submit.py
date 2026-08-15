@@ -78,6 +78,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _await_task_deferring_cancellation,
     _build_http_bridge_prewarm_text,
     _http_bridge_durable_lease_ttl_seconds,
+    _http_bridge_is_previous_response_owner_unavailable,
     _http_bridge_key_strength,
     _http_bridge_precreated_retry_failure_error,
     _http_bridge_prewarm_enabled,
@@ -2826,6 +2827,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 request_state=request_state,
                 restart_reader=True,
                 require_same_account=require_same_account,
+                require_preferred_account=request_state.file_required_preferred_account,
             )
             if send_request:
                 retry_text_data = self._http_bridge_text_with_account_installation_id(
@@ -2846,6 +2848,11 @@ class _HTTPBridgeRequestSubmitMixin:
             # owner retire the whole session with the typed, non-replayable
             # failure instead of falling back to the earlier close reason.
             raise
+        except ProxyResponseError as exc:
+            if _http_bridge_is_previous_response_owner_unavailable(exc):
+                raise
+            logger.warning("HTTP bridge retry on fresh upstream failed", exc_info=True)
+            return False
         except Exception:
             logger.warning("HTTP bridge retry on fresh upstream failed", exc_info=True)
             return False

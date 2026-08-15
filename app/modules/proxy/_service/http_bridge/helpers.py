@@ -165,6 +165,7 @@ from app.modules.proxy._service.warmup import (
 from app.modules.proxy.account_cache import is_account_routing_unavailable
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
+    _codex_backend_identity,
     _extract_model_class,
     _sticky_key_from_session_header,
     _sticky_key_from_turn_state_header,
@@ -1054,6 +1055,7 @@ def _http_bridge_incompatible_model_fork_key(
 ) -> "_HTTPBridgeSessionKey | None":
     if key.affinity_kind not in {
         "session_header",
+        "thread_header",
         "turn_state_header",
         "internal_unanchored_parallel",
         "internal_model_parallel",
@@ -1122,7 +1124,11 @@ def _http_bridge_parallel_fork_key(
     """Give incompatible or concurrent requests an independent websocket lane."""
 
     reason: str | None = None
-    if key.affinity_kind == "session_header" and incoming_turn_state is None and previous_response_id is None:
+    if (
+        key.affinity_kind in {"session_header", "thread_header"}
+        and incoming_turn_state is None
+        and previous_response_id is None
+    ):
         if inflight_creation:
             reason = "session_creation_inflight"
         elif session is not None and not session.closed:
@@ -1200,7 +1206,11 @@ def _http_bridge_request_needs_unanchored_handoff(
 ) -> bool:
     if forwarded_request:
         return forwarded_original_request_unanchored
-    return key.affinity_kind == "session_header" and incoming_turn_state is None and previous_response_id is None
+    return (
+        key.affinity_kind in {"session_header", "thread_header"}
+        and incoming_turn_state is None
+        and previous_response_id is None
+    )
 
 
 def _reserve_http_bridge_unanchored_handoff(
@@ -1568,14 +1578,19 @@ def _make_http_bridge_session_key(
         affinity_key = turn_state_key
         affinity_kind = "turn_state_header"
         strength: Literal["hard", "soft"] = "hard"
+    elif (thread_key := _codex_backend_identity(headers).thread_selection_key) is not None:
+        # prompt_cache_key is intentionally shared by current Codex root trees.
+        # The thread key is canonical identity; once a bridge exists it is hard
+        # transport continuity even though pre-bridge account locality is soft.
+        affinity_key = thread_key
+        affinity_kind = "thread_header"
+        strength = "hard"
     else:
         session_key = _sticky_key_from_session_header(headers)
         if session_key is not None:
-            # One Codex process session can host several independent agent
-            # threads. Codex keeps the process-level session header shared but
-            # gives every thread a stable explicit prompt_cache_key. Keying
-            # only by the header makes a later, non-overlapping child reuse the
-            # parent's upstream conversation and receive the wrong history.
+            # Compatibility path for clients that do not expose thread-id.
+            # Current Codex reaches the thread_header branch above; do not
+            # reintroduce prompt_cache_key as thread identity here.
             session_header_key = _make_http_bridge_session_header_fallback_key(
                 headers=headers,
                 api_key=api_key,
@@ -1603,6 +1618,12 @@ def _make_http_bridge_session_header_fallback_key(
     api_key: ApiKeyData | None,
     explicit_prompt_cache_key: str | None,
 ) -> _HTTPBridgeSessionKey | None:
+    if _codex_backend_identity(headers).thread_id is not None:
+        # Never let a current thread attach to the legacy
+        # (session-id, prompt_cache_key) lane: both values are shared across
+        # siblings. Exact turn-state/previous-response aliases are handled by
+        # durable lookup independently and remain the only safe migration path.
+        return None
     session_key = _sticky_key_from_session_header(headers)
     if session_key is None:
         return None
@@ -1616,6 +1637,39 @@ def _make_http_bridge_session_header_fallback_key(
         affinity_key,
         api_key.id if api_key is not None else None,
     )
+
+
+def _turn_keys(
+    headers: Mapping[str, str],
+    api_key: ApiKeyData | None,
+    requested_key: _HTTPBridgeSessionKey,
+    fallback_key: _HTTPBridgeSessionKey | None,
+) -> tuple[str | None, _HTTPBridgeSessionKey | None]:
+    thread_key = _codex_backend_identity(headers).thread_selection_key
+    thread_fallback_key = (
+        _HTTPBridgeSessionKey("thread_header", thread_key, api_key.id if api_key is not None else None)
+        if thread_key is not None
+        else None
+    )
+    incoming_session_key = None if thread_fallback_key is not None else _sticky_key_from_session_header(headers)
+    initial_session_key = (
+        fallback_key
+        or thread_fallback_key
+        or (requested_key if requested_key.affinity_kind == "session_header" else None)
+    )
+    return incoming_session_key, initial_session_key
+
+
+def _alias_fallback_key(
+    incoming_session_key: str | None,
+    initial_session_key: _HTTPBridgeSessionKey | None,
+    api_key_id: str | None,
+) -> _HTTPBridgeSessionKey | None:
+    if initial_session_key is not None:
+        return initial_session_key
+    if incoming_session_key is None:
+        return None
+    return _HTTPBridgeSessionKey("session_header", incoming_session_key, api_key_id)
 
 
 async def _http_bridge_should_wait_for_registration(
@@ -1709,7 +1763,7 @@ def _http_bridge_can_local_recover_without_ring(
     ):
         return True
     return (
-        key.affinity_kind == "session_header"
+        key.affinity_kind in {"session_header", "thread_header"}
         and previous_response_id is None
         and _sticky_key_from_turn_state_header(headers) is None
     )
@@ -2399,7 +2453,10 @@ def _effective_http_bridge_idle_ttl_seconds(
     codex_idle_ttl_seconds: float,
     prompt_cache_idle_ttl_seconds: float | None = None,
 ) -> float:
-    if affinity.kind == StickySessionKind.CODEX_SESSION:
+    if affinity.kind == StickySessionKind.CODEX_SESSION or affinity.codex_session_source == "thread_header":
+        # The DB row is bounded soft locality, but a live thread bridge owns
+        # upstream socket history and therefore receives the Codex continuity
+        # lifetime once created.
         return max(idle_ttl_seconds, codex_idle_ttl_seconds)
     if affinity.kind == StickySessionKind.PROMPT_CACHE and prompt_cache_idle_ttl_seconds is not None:
         return prompt_cache_idle_ttl_seconds
@@ -2626,7 +2683,7 @@ def _http_bridge_should_attempt_local_bootstrap_rebind(
     headers: Mapping[str, str],
     previous_response_id: str | None,
 ) -> bool:
-    if key.affinity_kind != "session_header":
+    if key.affinity_kind not in {"session_header", "thread_header"}:
         return False
     if previous_response_id is not None:
         return False

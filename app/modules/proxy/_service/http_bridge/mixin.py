@@ -70,6 +70,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_BACKGROUND_CLOSE_TIMEOUT_SECONDS,
     _HTTP_BRIDGE_INFLIGHT_STARTED_AT_ATTR,
     _active_http_bridge_instance_ring,
+    _alias_fallback_key,
     _durable_bridge_lookup_active_owner,
     _durable_bridge_lookup_allows_local_reuse,
     _forwarded_http_bridge_session_key,
@@ -123,6 +124,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _require_http_bridge_bound_account_not_excluded,
     _reserve_http_bridge_unanchored_handoff,
     _settle_failed_http_bridge_creation,
+    _turn_keys,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _close_http_bridge_session as _helpers_close_http_bridge_session,
@@ -207,7 +209,6 @@ from app.modules.proxy._service.warmup import (
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
     _extract_model_class,
-    _sticky_key_from_session_header,
     _sticky_key_from_turn_state_header,
 )
 from app.modules.proxy.continuity import (
@@ -430,8 +431,7 @@ class _HTTPBridgeMixin(
         request_scope_id = ensure_request_scope_id()
         api_key_id = api_key.id if api_key is not None else None
         incoming_turn_state = _sticky_key_from_turn_state_header(headers)
-        incoming_session_key = _sticky_key_from_session_header(headers)
-        initial_session_key = session_header_fallback_key or (key if key.affinity_kind == "session_header" else None)
+        incoming_session_key, initial_session_key = _turn_keys(headers, api_key, key, session_header_fallback_key)
         original_request_unanchored = _http_bridge_request_needs_unanchored_handoff(
             key, incoming_turn_state, previous_response_id, forwarded_request, forwarded_original_request_unanchored
         )
@@ -663,10 +663,10 @@ class _HTTPBridgeMixin(
                                 key=key.affinity_key,
                             ):
                                 key = _HTTPBridgeSessionKey("turn_state_header", incoming_turn_state, api_key_id)
-                        elif incoming_session_key is not None:
-                            key = initial_session_key or _HTTPBridgeSessionKey(
-                                "session_header", incoming_session_key, api_key_id
-                            )
+                        elif (
+                            fallback_key := _alias_fallback_key(incoming_session_key, initial_session_key, api_key_id)
+                        ) is not None:
+                            key = fallback_key
                             used_session_header_fallback = True
                         else:
                             key = _HTTPBridgeSessionKey("turn_state_header", incoming_turn_state, api_key_id)
@@ -1976,7 +1976,7 @@ class _HTTPBridgeMixin(
             lifecycle_lock=anyio.Lock(),
             last_used_at=_service_time().monotonic(),
             idle_ttl_seconds=idle_ttl_seconds,
-            codex_session=affinity.kind == StickySessionKind.CODEX_SESSION,
+            codex_session=(affinity.kind == StickySessionKind.CODEX_SESSION or key.affinity_kind == "thread_header"),
             prewarm_lock=anyio.Lock(),
             upstream_turn_state=_upstream_turn_state_from_socket(upstream),
             downstream_turn_state=None,
@@ -2395,7 +2395,7 @@ class _HTTPBridgeMixin(
                 session.last_completed_input_prefix_fingerprint = None
                 session.last_pending_tool_calls.clear()
                 session.affinity = selection_affinity or session.affinity
-                session.codex_session = False
+                session.codex_session = session.key.affinity_kind == "thread_header"
                 session.upstream_turn_state = None
                 session.downstream_turn_state = None
                 session.headers = {

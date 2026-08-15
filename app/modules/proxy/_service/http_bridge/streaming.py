@@ -1304,6 +1304,12 @@ class _HTTPBridgeStreamingMixin:
                         exc_info=True,
                     )
                 durable_lookup = None
+        if affinity.abandon_unavailable_legacy_owner:
+            # A verified goal restart deliberately resends all portable state.
+            # The old bridge row is therefore not additional ownership proof:
+            # promoting it to preferred_account_id below would bypass the only
+            # selection path allowed to atomically retire the raw sticky owner.
+            durable_lookup = None
         if durable_lookup is not None and durable_lookup.latest_response_id is not None:
             current_instance = _service_get_settings().http_responses_session_bridge_instance_id
             current_process_epoch = http_bridge_owner_process_epoch()
@@ -2053,7 +2059,9 @@ class _HTTPBridgeStreamingMixin:
                     previous_response_id=request_state.previous_response_id,
                     gateway_safe_mode=runtime_config.gateway_safe_mode,
                     allow_forward_to_owner=(
-                        not fresh_replay_excluded_account_ids and not force_local_recovery_creation
+                        not fresh_replay_excluded_account_ids
+                        and not force_local_recovery_creation
+                        and not affinity.abandon_unavailable_legacy_owner
                     ),
                     # A single-instance restart can leave an anchored durable
                     # row owned by the previous process epoch. Once the old
@@ -3508,8 +3516,11 @@ class _HTTPBridgeStreamingMixin:
         preserve_durable_lease: bool = False,
     ) -> None:
         async with self._http_bridge_lock:
-            if self._http_bridge_sessions.get(session.key) is session:
-                self._http_bridge_sessions.pop(session.key, None)
+            # Pending settlement below may block or fail before resource close
+            # starts. Transfer canonical routing into detached lifecycle
+            # ownership first so capacity, invalidation, and shutdown continue
+            # to see the live socket and leases throughout that interval.
+            self._detach_http_bridge_session_locked(session.key, expected_session=session)
         async with session.pending_lock:
             session.queued_request_count = 0
         await self._fail_pending_websocket_requests(

@@ -803,6 +803,7 @@ class _HTTPBridgeRequestSubmitMixin:
         recovery_turn_state: str | None = None,
     ) -> None:
         request_scope_id = ensure_request_scope_id()
+        owned_unanchored_handoff = session.unanchored_reservation_id == request_scope_id
         try:
             await self._submit_http_bridge_request_with_handoff(
                 session,
@@ -810,6 +811,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 text_data=text_data,
                 queue_limit=queue_limit,
                 request_scope_id=request_scope_id,
+                owned_unanchored_handoff=owned_unanchored_handoff,
                 recovery_turn_state=recovery_turn_state,
             )
         finally:
@@ -817,6 +819,17 @@ class _HTTPBridgeRequestSubmitMixin:
                 session,
                 request_scope_id=request_scope_id,
             )
+            # Inner pre-submit cleanup may clear the reservation before control
+            # returns here, so ownership must be captured before awaiting it.
+            # Only that request can make detached-session retirement newly
+            # ready; an ordinary send/reader failure already owns terminal
+            # settlement, and closing again would run that funnel twice.
+            if (
+                owned_unanchored_handoff
+                and session.upstream_control.retire_after_drain
+                and not session.upstream_close_attempted
+            ):
+                await self._retire_http_bridge_after_drain_if_ready(session)
 
     async def _http_bridge_operation_fenced_continuity_replay_allowed(
         self: Any,
@@ -871,6 +884,7 @@ class _HTTPBridgeRequestSubmitMixin:
         text_data: str,
         queue_limit: int,
         request_scope_id: str,
+        owned_unanchored_handoff: bool,
         recovery_turn_state: str | None = None,
     ) -> None:
         recovery_attempt_consumed = False
@@ -1411,7 +1425,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     error_type="server_error",
                 ),
             )
-        if session.upstream_control.retire_after_drain:
+        if session.upstream_control.retire_after_drain and not owned_unanchored_handoff:
             await _cleanup_unsubmitted_recovery_claim()
             if not session.upstream_close_attempted:
                 await self._retire_http_bridge_after_drain_if_ready(session)
@@ -1622,6 +1636,12 @@ class _HTTPBridgeRequestSubmitMixin:
                     current_session = http_bridge_sessions.get(session.key)
                 session_unregistered = current_session is None and _http_bridge_key_strength(session.key) == "hard"
                 session_replaced = current_session is not None and current_session is not session
+                # Queue publication clears the mutable reservation marker. The
+                # proof captured before the first await still authorizes exactly
+                # that request to submit on its detached, draining generation.
+                detached_handoff_can_submit = (
+                    owned_unanchored_handoff and session.upstream_control.retire_after_drain and not session.closed
+                )
                 if session.closed and current_session is session and not session.upstream_control.retire_after_drain:
                     recovered = await self._retry_http_bridge_request_on_fresh_upstream(
                         session,
@@ -1632,7 +1652,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     )
                     if recovered:
                         session.closed = False
-                if session.closed or session_unregistered or session_replaced:
+                if session.closed or ((session_unregistered or session_replaced) and not detached_handoff_can_submit):
                     _log_http_bridge_event(
                         "submit_on_closed",
                         session.key,
@@ -2682,7 +2702,10 @@ class _HTTPBridgeRequestSubmitMixin:
                 _http_bridge_request_counts_against_queue(request_state) for request_state in session.pending_requests
             )
             should_reconnect = (
-                not has_visible_pending and session.queued_request_count == 0 and not session.upstream_close_attempted
+                not has_visible_pending
+                and session.queued_request_count == 0
+                and session.unanchored_reservation_id is None
+                and not session.upstream_close_attempted
             )
             if should_reconnect:
                 session.pending_requests.clear()
@@ -2756,10 +2779,11 @@ class _HTTPBridgeRequestSubmitMixin:
             )
         session.closed = True
         async with self._http_bridge_lock:
-            if self._http_bridge_sessions.get(session.key) is session:
-                self._http_bridge_sessions.pop(session.key, None)
-                self._unregister_http_bridge_turn_states_locked(session)
-                self._unregister_http_bridge_previous_response_ids_locked(session)
+            # Bounded close may return while resource finalization is still
+            # running. Detachment transfers ownership instead of freeing the
+            # capacity slot at canonical removal, and leaves a failed close
+            # discoverable by shutdown/account invalidation for a later retry.
+            self._detach_http_bridge_session_locked(session.key, expected_session=session)
         async with session.pending_lock:
             should_close = not session.upstream_close_attempted
             if should_close:
@@ -3564,6 +3588,10 @@ class _HTTPBridgeRequestSubmitMixin:
         try:
             if owner_rebind_affinity.legacy_selection_key is not None:
                 async with self._repo_factory() as repos:
+                    # A goal restart abandons only session-header interpretation
+                    # of the legacy raw row. Preserve that typed capability here:
+                    # omitting it would resurrect the retained turn-state owner
+                    # during a later security-authorized replacement.
                     legacy_owner_id = await repos.sticky_sessions.get_account_id(
                         owner_rebind_affinity.legacy_selection_key,
                         # The new thread row may be PROMPT_CACHE, but the raw
@@ -3571,6 +3599,7 @@ class _HTTPBridgeRequestSubmitMixin:
                         # remains durable hard ownership.
                         kind=StickySessionKind.CODEX_SESSION,
                         max_age_seconds=None,
+                        continuity_source=owner_rebind_affinity.codex_session_source,
                     )
                 if legacy_owner_id is not None and legacy_owner_id != account_id:
                     raise ProxyResponseError(

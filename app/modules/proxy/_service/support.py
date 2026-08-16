@@ -818,6 +818,34 @@ class _DeferredAccountBackoffTracker:
     current_lifecycle: _DeferredAccountBackoffLifecycle | None = None
 
 
+@dataclass(eq=False, slots=True)
+class _HTTPBridgeResponseCreateAttempt:
+    ordinal: int
+    disarmed: bool = False
+    response_observed: bool = False
+    retry_circuit_failure_recorded: bool = False
+    retry_circuit_failure_settled: anyio.Event | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _HTTPBridgeRetryCircuitAttemptSelection:
+    kind: Literal["absent", "eligible", "recorded", "settled", "ineligible"]
+    attempts: tuple[_HTTPBridgeResponseCreateAttempt, ...] = ()
+
+    def __post_init__(self) -> None:
+        carries_attempts = self.kind in {"eligible", "recorded", "settled"}
+        if carries_attempts != bool(self.attempts):
+            raise ValueError(f"invalid retry-circuit attempt selection: {self.kind}")
+
+    @property
+    def attempt(self) -> _HTTPBridgeResponseCreateAttempt | None:
+        return self.attempts[0] if len(self.attempts) == 1 else None
+
+    @property
+    def ambiguous(self) -> bool:
+        return len(self.attempts) > 1
+
+
 @dataclass
 class _WebSocketRequestState:
     request_id: str
@@ -840,6 +868,8 @@ class _WebSocketRequestState:
     # send. Retries replace this value so admission wait and prior attempts do
     # not age a fresh send into the eventless owner deadline.
     response_create_sent_at: float | None = None
+    response_create_attempt_count: int = 0
+    response_create_attempt: _HTTPBridgeResponseCreateAttempt | None = None
     bridge_queue_wait_started_at: float | None = None
     # Monotonic deadline of the original bridge request budget. Retry and
     # recovery paths re-prepare request states with a fresh started_at, so
@@ -1355,9 +1385,21 @@ def _clear_websocket_deferred_reasoning_downstream_texts(request_state: _WebSock
         request_state.deferred_reasoning_downstream_texts = []
 
 
+def _mark_response_create_attempt_observed(
+    request_state: _WebSocketRequestState | None,
+    event_type: str | None,
+) -> None:
+    if request_state is None or event_type is None or not event_type.startswith("response."):
+        return
+    attempt = request_state.response_create_attempt
+    if attempt is not None:
+        attempt.response_observed = True
+
+
 def _record_response_event(request_state: _WebSocketRequestState | None, event_type: str | None) -> None:
     if request_state is None or event_type is None or not event_type.startswith("response."):
         return
+    _mark_response_create_attempt_observed(request_state, event_type)
     request_state.last_upstream_activity_at = time.monotonic()
     if event_type in {"response.failed", "response.incomplete"}:
         return

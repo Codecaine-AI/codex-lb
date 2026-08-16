@@ -938,7 +938,15 @@ def test_http_bridge_eventless_precreated_deadline_survives_reasoning_prelude_wi
 async def test_process_http_bridge_upstream_text_anchors_deferred_reasoning_prelude_without_created() -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     request_state = _make_eventless_http_bridge_owner(sent_at=time.monotonic() - 2.0)
+    attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    request_state.response_create_attempt = attempt
     session = _make_bridge_session(pending_requests=deque([request_state]), queued_request_count=1)
+    lookup_retry_circuit = AsyncMock(return_value=None)
+    persist_retry_circuit = AsyncMock(return_value=None)
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=lookup_retry_circuit,
+        persist_retry_circuit=persist_retry_circuit,
+    )
 
     await service._process_http_bridge_upstream_text(
         session,
@@ -955,6 +963,7 @@ async def test_process_http_bridge_upstream_text_anchors_deferred_reasoning_prel
     assert request_state.response_id is None
     assert request_state.downstream_visible is False
     assert request_state.upstream_model_output_seen is True
+    assert attempt.response_observed is True
     assert request_state.last_upstream_activity_at is not None
     sent_at = request_state.response_create_sent_at
     assert sent_at is not None
@@ -968,6 +977,22 @@ async def test_process_http_bridge_upstream_text_anchors_deferred_reasoning_prel
         == request_state.last_upstream_activity_at
         + http_bridge_helpers_module._HTTP_BRIDGE_EVENTLESS_RESPONSE_CREATED_MAX_SECONDS
     )
+    selection = http_bridge_helpers_module._http_bridge_retry_circuit_attempt_selection_for_pending_requests(
+        (request_state,)
+    )
+    assert selection.kind == "settled"
+    assert selection.attempt is attempt
+    assert (
+        await service._record_http_bridge_retry_circuit_failure_for_attempt_selection(
+            session,
+            detail="stream_idle_timeout",
+            selection=selection,
+        )
+        is None
+    )
+    assert session.key not in cast(Any, service)._http_bridge_retry_circuits
+    lookup_retry_circuit.assert_not_awaited()
+    persist_retry_circuit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -998,6 +1023,7 @@ async def test_http_bridge_send_replaces_timestamp_and_wakes_existing_reader(
         request_state,
         "first",
     )
+    first_attempt = request_state.response_create_attempt
     session.upstream_reader_wakeup.clear()
     await http_bridge_request_submit_module._send_http_bridge_request_text_with_archive_id(
         session,
@@ -1007,6 +1033,11 @@ async def test_http_bridge_send_replaces_timestamp_and_wakes_existing_reader(
 
     assert seen_sent_ats == [100.0, 200.0]
     assert request_state.response_create_sent_at == 200.0
+    assert first_attempt is not None
+    assert first_attempt.ordinal == 1
+    assert request_state.response_create_attempt is not first_attempt
+    assert request_state.response_create_attempt is not None
+    assert request_state.response_create_attempt.ordinal == 2
     assert session.upstream_reader_wakeup.is_set() is True
 
 
@@ -1042,6 +1073,8 @@ async def test_http_bridge_failed_send_disarms_eventless_deadline(
         )
 
     assert request_state.response_create_sent_at is None
+    assert request_state.response_create_attempt is not None
+    assert request_state.response_create_attempt.disarmed is True
     assert session.upstream_reader_wakeup.is_set() is True
     assert (
         http_bridge_helpers_module._http_bridge_eventless_precreated_deadline(
@@ -2501,7 +2534,9 @@ async def test_response_create_gate_timeout_retires_old_pending_without_upstream
         retire_session: proxy_service._HTTPBridgeSession,
         *,
         detail: str,
+        retry_circuit_attempt_selection: proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection,
     ) -> None:
+        assert retry_circuit_attempt_selection.kind == "absent"
         retire_calls.append(detail)
         retire_session.closed = True
 
@@ -2608,7 +2643,9 @@ async def test_response_create_gate_timeout_retires_closed_anchored_pending_with
         retire_session: proxy_service._HTTPBridgeSession,
         *,
         detail: str,
+        retry_circuit_attempt_selection: proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection,
     ) -> None:
+        assert retry_circuit_attempt_selection.kind == "absent"
         retire_calls.append(detail)
         retire_session.closed = True
 
@@ -2697,7 +2734,9 @@ async def test_response_create_gate_timeout_retires_old_precreated_request_after
         retire_session: proxy_service._HTTPBridgeSession,
         *,
         detail: str,
+        retry_circuit_attempt_selection: proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection,
     ) -> None:
+        assert retry_circuit_attempt_selection.kind == "absent"
         retire_calls.append(detail)
         retire_session.closed = True
 
@@ -24326,6 +24365,119 @@ async def test_http_bridge_reader_wakes_and_retires_lone_eventless_owner_without
         session=session,
     )
     assert "http_bridge_event event=missing_response_created_timeout" in caplog.text
+    if leading_telemetry:
+        assert session.key not in service._http_bridge_retry_circuits
+    else:
+        assert service._http_bridge_retry_circuits[session.key].consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_stream_and_reader_count_one_eventless_send_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    upstream = _SilentEventlessUpstream()
+    session = _make_bridge_session(key_value="eventless-observer-race")
+    session.upstream = cast(UpstreamWebSocket, upstream)
+    service._http_bridge_sessions[session.key] = session
+    settings = _make_app_settings(
+        sse_keepalive_interval_seconds=0.02,
+        stream_idle_timeout_seconds=0.3,
+        http_responses_session_bridge_request_budget_seconds=1.0,
+        http_responses_session_bridge_stuck_gate_retire_after_seconds=0.005,
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(http_bridge_streaming_module, "_stream_keepalive_max_count", lambda: 1)
+    monkeypatch.setattr(proxy_service, "_HTTP_BRIDGE_STARTUP_KEEPALIVE_GRACE_SECONDS", 0.001)
+    monkeypatch.setattr(service, "_handle_stream_error", AsyncMock())
+    monkeypatch.setattr(service, "_write_request_log", AsyncMock())
+    persist_retry_circuit = AsyncMock(return_value=None)
+    service._durable_bridge = cast(
+        Any,
+        SimpleNamespace(
+            lookup_retry_circuit=AsyncMock(return_value=None),
+            persist_retry_circuit=persist_retry_circuit,
+        ),
+    )
+
+    async def submit(
+        target_session: proxy_service._HTTPBridgeSession,
+        *,
+        request_state: proxy_service._WebSocketRequestState,
+        text_data: str,
+        queue_limit: int,
+    ) -> None:
+        del queue_limit
+        gate = target_session.response_create_gate
+        await gate.acquire()
+        request_state.response_create_gate = gate
+        request_state.response_create_gate_acquired = True
+        request_state.awaiting_response_created = True
+        request_state.request_text = text_data
+        async with target_session.pending_lock:
+            target_session.pending_requests.append(request_state)
+            target_session.queued_request_count = 1
+        await http_bridge_request_submit_module._send_http_bridge_request_text_with_archive_id(
+            target_session,
+            request_state,
+            text_data,
+        )
+
+    monkeypatch.setattr(service, "_submit_http_bridge_request", submit)
+    request_state = _make_eventless_http_bridge_owner(request_id="req-eventless-observer-race", sent_at=0.0)
+    request_state.started_at = time.monotonic()
+    request_state.response_create_sent_at = None
+    request_state.response_create_gate = None
+    request_state.response_create_gate_acquired = False
+    reader_retry_started = asyncio.Event()
+    release_reader_retry = asyncio.Event()
+
+    async def retry_precreated(
+        _session: proxy_service._HTTPBridgeSession,
+        *,
+        restart_reader: bool = False,
+    ) -> bool:
+        if restart_reader:
+            await asyncio.wait_for(reader_retry_started.wait(), timeout=2.0)
+            return False
+        request_state.response_create_sent_at = None
+        reader_retry_started.set()
+        await asyncio.wait_for(release_reader_retry.wait(), timeout=2.0)
+        return False
+
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+
+    reader_task = asyncio.create_task(service._relay_http_bridge_upstream_messages(session))
+    await asyncio.wait_for(upstream.first_receive_started.wait(), timeout=0.5)
+    stream = service._stream_http_bridge_session_events(
+        session,
+        request_state=request_state,
+        text_data='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
+        queue_limit=8,
+        propagate_http_errors=False,
+        downstream_turn_state=None,
+    )
+    try:
+        terminal_task = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(reader_retry_started.wait(), timeout=1.0)
+        terminal = await asyncio.wait_for(terminal_task, timeout=1.0)
+        assert '"code":"stream_idle_timeout"' in terminal
+        release_reader_retry.set()
+        await asyncio.wait_for(reader_task, timeout=1.0)
+
+        state = cast(Any, service)._http_bridge_retry_circuits[session.key]
+        assert state.consecutive_failures == 1
+        assert state.cooldown_until == 0.0
+        assert request_state.response_create_attempt is not None
+        assert request_state.response_create_attempt.retry_circuit_failure_recorded is True
+        assert persist_retry_circuit.await_count == 1
+    finally:
+        release_reader_retry.set()
+        if not reader_task.done():
+            reader_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await reader_task
+        await stream.aclose()
 
 
 @pytest.mark.asyncio
@@ -25100,6 +25252,7 @@ async def test_http_bridge_liveness_timeout_is_neutral_not_replayed_and_forces_r
         detail=UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
         response_events_seen=0,
         retired_request_count=1,
+        retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
     assert session.queued_request_count == 0
     assert session.closed is True
@@ -25246,12 +25399,17 @@ async def test_http_bridge_liveness_send_receive_race_settles_request_once(
     assert session.queued_request_count == 0
     assert session.closed is True
     assert session.liveness_settlement_owner == "send"
-    retire.assert_awaited_once_with(
-        session,
-        detail=UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
-        response_events_seen=0,
-        retired_request_count=2,
-    )
+    retire.assert_awaited_once()
+    retire_call = retire.await_args
+    assert retire_call is not None
+    assert retire_call.args == (session,)
+    assert retire_call.kwargs["detail"] == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE
+    assert retire_call.kwargs["response_events_seen"] == 0
+    assert retire_call.kwargs["retired_request_count"] == 2
+    assert request_state.response_create_attempt is not None
+    retry_circuit_attempt_selection = retire_call.kwargs["retry_circuit_attempt_selection"]
+    assert retry_circuit_attempt_selection.attempt is request_state.response_create_attempt
+    assert request_state.response_create_attempt.disarmed is True
 
 
 @pytest.mark.asyncio
@@ -25374,6 +25532,7 @@ async def test_http_bridge_closed_without_liveness_claim_still_settles_pending_s
         detail=UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
         response_events_seen=0,
         retired_request_count=2,
+        retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
 
 
@@ -25393,6 +25552,10 @@ async def test_http_bridge_retry_send_network_failure_is_neutral_and_not_replaye
         request_text='{"type":"response.create","model":"gpt-5.4","input":"hello"}',
         transport="http",
     )
+    first_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    request_state.response_create_attempt_count = 1
+    request_state.response_create_attempt = first_attempt
+    request_state.response_create_sent_at = time.monotonic()
     session = _make_bridge_session(
         key_value="bridge-retry-send-network",
         pending_requests=deque([request_state]),
@@ -25431,15 +25594,22 @@ async def test_http_bridge_retry_send_network_failure_is_neutral_and_not_replaye
 
     await service._relay_http_bridge_upstream_messages(session)
 
-    assert failure_calls == [
-        {
-            "error_code": "proxy_network_unavailable",
-            "error_message": "Codex upstream websocket send failed: OSError",
-            "penalize_account": False,
-        }
-    ]
+    assert len(failure_calls) == 1
+    failure_call = failure_calls[0]
+    assert failure_call["error_code"] == "proxy_network_unavailable"
+    assert failure_call["error_message"] == "Codex upstream websocket send failed: OSError"
+    assert failure_call["penalize_account"] is False
+    retry_circuit_attempt_selection = failure_call["retry_circuit_attempt_selection"]
+    assert isinstance(
+        retry_circuit_attempt_selection,
+        proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection,
+    )
+    assert retry_circuit_attempt_selection.attempt is first_attempt
     assert request_state.replay_count == 1
     retry_send.assert_awaited_once()
+    assert request_state.response_create_attempt is not first_attempt
+    assert request_state.response_create_attempt is not None
+    assert request_state.response_create_attempt.disarmed is True
     assert session.closed is True
 
 
@@ -25498,7 +25668,140 @@ async def test_http_bridge_clean_close_before_response_does_not_penalize_account
         detail="stream_incomplete",
         response_events_seen=0,
         retired_request_count=0,
+        retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_clean_close_retry_failure_preserves_pre_recovery_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = _make_eventless_http_bridge_owner(request_id="req-clean-close-retry-attempt")
+    original_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    replacement_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=2)
+    request_state.response_create_attempt = original_attempt
+    session = _make_bridge_session(
+        key_value="bridge-clean-close-retry-attempt",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.upstream = cast(
+        UpstreamWebSocket,
+        SimpleNamespace(
+            receive=AsyncMock(return_value=UpstreamWebSocketMessage(kind="close", close_code=1000)),
+            close=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+
+    async def retry_precreated(target_session: Any, **_kwargs: object) -> bool:
+        assert target_session is session
+        request_state.response_create_attempt = replacement_attempt
+        request_state.response_create_sent_at = None
+        return False
+
+    failure_calls: list[dict[str, object]] = []
+
+    async def fail_reader(target_session: Any, **kwargs: object) -> bool:
+        assert target_session is session
+        failure_calls.append(dict(kwargs))
+        target_session.closed = True
+        return True
+
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_fail_http_bridge_reader_and_maybe_retire", fail_reader)
+
+    await service._relay_http_bridge_upstream_messages(session)
+
+    assert len(failure_calls) == 1
+    retry_circuit_attempt_selection = failure_calls[0]["retry_circuit_attempt_selection"]
+    assert isinstance(
+        retry_circuit_attempt_selection,
+        proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection,
+    )
+    assert retry_circuit_attempt_selection.attempt is original_attempt
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_reader_exception_captures_attempt_before_lifecycle_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = _make_eventless_http_bridge_owner(request_id="req-reader-exception-attempt")
+    request_state.started_at = time.monotonic()
+    request_state.response_create_sent_at = None
+    original_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    replacement_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=2)
+    request_state.response_create_attempt = original_attempt
+    session = _make_bridge_session(
+        key_value="bridge-reader-exception-attempt",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.upstream = cast(
+        UpstreamWebSocket,
+        SimpleNamespace(
+            receive=AsyncMock(
+                return_value=UpstreamWebSocketMessage(
+                    kind="text",
+                    text='{"type":"response.created","response":{"id":"resp_reader_exception"}}',
+                )
+            ),
+            close=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(
+        service,
+        "_process_http_bridge_upstream_text",
+        AsyncMock(side_effect=RuntimeError("processing failed")),
+    )
+    attempt_captured = asyncio.Event()
+    original_selector = (
+        http_bridge_upstream_events_module._http_bridge_retry_circuit_attempt_selection_for_pending_requests
+    )
+
+    def capture_attempt_before_lifecycle_wait(
+        request_states: tuple[proxy_service._WebSocketRequestState, ...],
+    ) -> proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection:
+        selection = original_selector(request_states)
+        attempt_captured.set()
+        return selection
+
+    monkeypatch.setattr(
+        http_bridge_upstream_events_module,
+        "_http_bridge_retry_circuit_attempt_selection_for_pending_requests",
+        capture_attempt_before_lifecycle_wait,
+    )
+    failure_calls: list[dict[str, object]] = []
+
+    async def fail_reader(
+        target_session: proxy_service._HTTPBridgeSession,
+        **kwargs: object,
+    ) -> bool:
+        assert target_session is session
+        failure_calls.append(dict(kwargs))
+        target_session.closed = True
+        return True
+
+    monkeypatch.setattr(service, "_fail_http_bridge_reader_and_maybe_retire", fail_reader)
+
+    async with session.lifecycle_lock:
+        relay_task = asyncio.create_task(service._relay_http_bridge_upstream_messages(session))
+        await asyncio.wait_for(attempt_captured.wait(), timeout=1.0)
+        request_state.response_create_attempt = replacement_attempt
+
+    await asyncio.wait_for(relay_task, timeout=1.0)
+
+    assert len(failure_calls) == 1
+    retry_circuit_attempt_selection = failure_calls[0]["retry_circuit_attempt_selection"]
+    assert isinstance(
+        retry_circuit_attempt_selection,
+        proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection,
+    )
+    assert retry_circuit_attempt_selection.attempt is original_attempt
+    assert replacement_attempt.retry_circuit_failure_recorded is False
 
 
 @pytest.mark.asyncio
@@ -26261,6 +26564,470 @@ async def test_http_bridge_retry_circuit_counts_stream_idle_timeout() -> None:
     assert cast(Any, service)._http_bridge_retry_circuits[hard_session.key].consecutive_failures == 1
 
 
+@pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_claims_one_attempt_once_across_concurrent_observers() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-attempt-concurrent")
+    attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    both_lookups_started = asyncio.Event()
+    lookup_count = 0
+
+    async def lookup_retry_circuit(**_kwargs: object) -> None:
+        nonlocal lookup_count
+        lookup_count += 1
+        if lookup_count == 2:
+            both_lookups_started.set()
+        await asyncio.wait_for(both_lookups_started.wait(), timeout=0.5)
+
+    persist_retry_circuit = AsyncMock(return_value=None)
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(side_effect=lookup_retry_circuit),
+        persist_retry_circuit=persist_retry_circuit,
+    )
+
+    results = await asyncio.gather(
+        service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=attempt,
+        ),
+        service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=attempt,
+        ),
+    )
+
+    state = cast(Any, service)._http_bridge_retry_circuits[session.key]
+    assert results == [1, 1]
+    assert state.consecutive_failures == 1
+    assert state.cooldown_until == 0.0
+    assert attempt.retry_circuit_failure_recorded is True
+    assert persist_retry_circuit.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_duplicate_waits_for_persisted_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-attempt-persist-merge")
+    attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    persist_started = asyncio.Event()
+    allow_persist = asyncio.Event()
+    duplicate_wait_started = asyncio.Event()
+
+    async def persist_retry_circuit(**_kwargs: object) -> SimpleNamespace:
+        persist_started.set()
+        await asyncio.wait_for(allow_persist.wait(), timeout=0.5)
+        return SimpleNamespace(
+            consecutive_failures=2,
+            cooldown_until_epoch=time.time() + 60.0,
+            last_detail="stream_idle_timeout",
+            updated_at_epoch=time.time(),
+        )
+
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(return_value=None),
+        persist_retry_circuit=AsyncMock(side_effect=persist_retry_circuit),
+    )
+    await_attempt_settlement = service._await_http_bridge_retry_circuit_attempt_settlement
+
+    async def track_attempt_settlement(
+        target_session: proxy_service._HTTPBridgeSession,
+        *,
+        attempt: proxy_support_module._HTTPBridgeResponseCreateAttempt,
+        detail: str,
+    ) -> int:
+        duplicate_wait_started.set()
+        return await await_attempt_settlement(
+            target_session,
+            attempt=attempt,
+            detail=detail,
+        )
+
+    monkeypatch.setattr(
+        service,
+        "_await_http_bridge_retry_circuit_attempt_settlement",
+        track_attempt_settlement,
+    )
+
+    first_task = asyncio.create_task(
+        service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=attempt,
+        )
+    )
+    await asyncio.wait_for(persist_started.wait(), timeout=0.5)
+    duplicate_task = asyncio.create_task(
+        service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=attempt,
+        )
+    )
+    await asyncio.wait_for(duplicate_wait_started.wait(), timeout=0.5)
+    assert duplicate_task.done() is False
+
+    allow_persist.set()
+
+    assert await asyncio.wait_for(first_task, timeout=0.5) == 2
+    assert await asyncio.wait_for(duplicate_task, timeout=0.5) == 2
+    state = cast(Any, service)._http_bridge_retry_circuits[session.key]
+    assert state.consecutive_failures == 2
+    assert attempt.retry_circuit_failure_settled is not None
+    assert attempt.retry_circuit_failure_settled.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_duplicate_does_not_retry_failed_persistence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-attempt-persist-failure")
+    attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    persist_retry_circuit = AsyncMock(side_effect=RuntimeError("durable write unavailable"))
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(return_value=None),
+        persist_retry_circuit=persist_retry_circuit,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        first_count = await service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=attempt,
+        )
+        duplicate_count = await service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=attempt,
+        )
+
+    assert (first_count, duplicate_count) == (1, 1)
+    assert cast(Any, service)._http_bridge_retry_circuits[session.key].consecutive_failures == 1
+    assert persist_retry_circuit.await_count == 1
+    assert "Failed to persist HTTP bridge retry circuit" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_counts_distinct_send_attempts_and_not_delayed_old_observer() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-attempt-generations")
+    persist_retry_circuit = AsyncMock(return_value=None)
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(return_value=None),
+        persist_retry_circuit=persist_retry_circuit,
+    )
+    first_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    second_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=2)
+
+    first_count = await service._record_http_bridge_retry_circuit_failure(
+        session,
+        detail="stream_idle_timeout",
+        attempt=first_attempt,
+    )
+    second_count = await service._record_http_bridge_retry_circuit_failure(
+        session,
+        detail="stream_idle_timeout",
+        attempt=second_attempt,
+    )
+    delayed_first_count = await service._record_http_bridge_retry_circuit_failure(
+        session,
+        detail="stream_idle_timeout",
+        attempt=first_attempt,
+    )
+
+    state = cast(Any, service)._http_bridge_retry_circuits[session.key]
+    assert (first_count, second_count, delayed_first_count) == (1, 2, 2)
+    assert state.consecutive_failures == 2
+    assert state.cooldown_until > time.monotonic()
+    assert first_attempt.retry_circuit_failure_recorded is True
+    assert second_attempt.retry_circuit_failure_recorded is True
+    assert persist_retry_circuit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_does_not_claim_attempt_when_response_wins_lookup_race() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-attempt-response-race")
+    request_state = _make_eventless_http_bridge_owner()
+    attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    request_state.response_create_attempt = attempt
+    lookup_started = asyncio.Event()
+    release_lookup = asyncio.Event()
+
+    async def lookup_retry_circuit(**_kwargs: object) -> None:
+        lookup_started.set()
+        await asyncio.wait_for(release_lookup.wait(), timeout=0.5)
+
+    persist_retry_circuit = AsyncMock(return_value=None)
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(side_effect=lookup_retry_circuit),
+        persist_retry_circuit=persist_retry_circuit,
+    )
+    record_task = asyncio.create_task(
+        service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=attempt,
+        )
+    )
+    await asyncio.wait_for(lookup_started.wait(), timeout=0.5)
+
+    proxy_support_module._record_response_event(request_state, "response.created")
+    release_lookup.set()
+
+    assert await asyncio.wait_for(record_task, timeout=0.5) is None
+    assert attempt.response_observed is True
+    assert attempt.retry_circuit_failure_recorded is False
+    assert session.key not in cast(Any, service)._http_bridge_retry_circuits
+    persist_retry_circuit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_ignores_disarmed_send_attempt() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-attempt-disarmed")
+    attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1, disarmed=True)
+    lookup_retry_circuit = AsyncMock(return_value=None)
+    persist_retry_circuit = AsyncMock(return_value=None)
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=lookup_retry_circuit,
+        persist_retry_circuit=persist_retry_circuit,
+    )
+
+    result = await service._record_http_bridge_retry_circuit_failure(
+        session,
+        detail="stream_idle_timeout",
+        attempt=attempt,
+    )
+
+    assert result is None
+    assert attempt.retry_circuit_failure_recorded is False
+    assert session.key not in cast(Any, service)._http_bridge_retry_circuits
+    lookup_retry_circuit.assert_not_awaited()
+    persist_retry_circuit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_delayed_duplicate_does_not_recreate_cleared_state() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-attempt-reset-race")
+    attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    lookup_retry_circuit = AsyncMock(return_value=None)
+    persist_retry_circuit = AsyncMock(return_value=None)
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=lookup_retry_circuit,
+        persist_retry_circuit=persist_retry_circuit,
+    )
+
+    assert (
+        await service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=attempt,
+        )
+        == 1
+    )
+    await service._clear_http_bridge_retry_circuit(session)
+    lookup_count_after_clear = lookup_retry_circuit.await_count
+
+    assert (
+        await service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=attempt,
+        )
+        == 0
+    )
+    assert session.key not in cast(Any, service)._http_bridge_retry_circuits
+    assert lookup_retry_circuit.await_count == lookup_count_after_clear
+    assert persist_retry_circuit.await_count == 1
+
+
+def test_http_bridge_retry_circuit_attempt_selection_prefers_one_eventless_owner() -> None:
+    eventless = _make_eventless_http_bridge_owner(request_id="req-attempt-eventless")
+    eventless_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    eventless.response_create_attempt = eventless_attempt
+    responded = _make_eventless_http_bridge_owner(request_id="req-attempt-responded")
+    responded_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(
+        ordinal=1,
+        response_observed=True,
+    )
+    responded.response_create_attempt = responded_attempt
+    responded.response_event_count = 1
+    responded.response_id = "resp-attempt-responded"
+
+    selection = http_bridge_helpers_module._http_bridge_retry_circuit_attempt_selection_for_pending_requests(
+        (responded, eventless)
+    )
+    assert selection.kind == "eligible"
+    assert selection.attempt is eventless_attempt
+
+    selection = http_bridge_helpers_module._http_bridge_retry_circuit_attempt_selection_for_pending_requests(
+        (responded,)
+    )
+    assert selection.kind == "settled"
+    assert selection.attempt is responded_attempt
+
+    reconnecting = _make_eventless_http_bridge_owner(request_id="req-attempt-reconnecting")
+    reconnecting_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    reconnecting.response_create_attempt = reconnecting_attempt
+    reconnecting.response_create_sent_at = None
+    selection = http_bridge_helpers_module._http_bridge_retry_circuit_attempt_selection_for_pending_requests(
+        (reconnecting,)
+    )
+    assert selection.kind == "eligible"
+    assert selection.attempt is reconnecting_attempt
+
+    other_eventless = _make_eventless_http_bridge_owner(request_id="req-attempt-other-eventless")
+    other_eventless_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    other_eventless.response_create_attempt = other_eventless_attempt
+    selection = http_bridge_helpers_module._http_bridge_retry_circuit_attempt_selection_for_pending_requests(
+        (eventless, other_eventless)
+    )
+    assert selection.kind == "eligible"
+    assert selection.ambiguous is True
+    assert selection.attempt is None
+    assert selection.attempts == (eventless_attempt, other_eventless_attempt)
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_ambiguous_attempts_never_fall_back_to_unscoped_failure() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-attempt-ambiguous")
+    first_request = _make_eventless_http_bridge_owner(request_id="req-attempt-ambiguous-first")
+    second_request = _make_eventless_http_bridge_owner(request_id="req-attempt-ambiguous-second")
+    first_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    second_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    first_request.response_create_attempt = first_attempt
+    second_request.response_create_attempt = second_attempt
+    lookup_retry_circuit = AsyncMock(return_value=None)
+    persist_retry_circuit = AsyncMock(return_value=None)
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=lookup_retry_circuit,
+        persist_retry_circuit=persist_retry_circuit,
+    )
+    selection = http_bridge_helpers_module._http_bridge_retry_circuit_attempt_selection_for_pending_requests(
+        (first_request, second_request)
+    )
+
+    assert selection.kind == "eligible"
+    assert selection.ambiguous is True
+    assert (
+        await service._record_http_bridge_retry_circuit_failure_for_attempt_selection(
+            session,
+            detail="stream_idle_timeout",
+            selection=selection,
+        )
+        is None
+    )
+    assert session.key not in cast(Any, service)._http_bridge_retry_circuits
+    assert first_attempt.retry_circuit_failure_recorded is False
+    assert second_attempt.retry_circuit_failure_recorded is False
+    lookup_retry_circuit.assert_not_awaited()
+    persist_retry_circuit.assert_not_awaited()
+
+    first_count = await service._record_http_bridge_retry_circuit_failure(
+        session,
+        detail="stream_idle_timeout",
+        attempt=first_attempt,
+    )
+    second_count = await service._record_http_bridge_retry_circuit_failure(
+        session,
+        detail="stream_idle_timeout",
+        attempt=second_attempt,
+    )
+
+    assert (first_count, second_count) == (1, 2)
+    assert persist_retry_circuit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_ineligible_attempt_never_falls_back_to_unscoped_failure() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-attempt-ineligible")
+    request_state = _make_eventless_http_bridge_owner(request_id="req-attempt-ineligible")
+    attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    request_state.response_create_attempt = attempt
+    request_state.response_event_count = 1
+    lookup_retry_circuit = AsyncMock(return_value=None)
+    persist_retry_circuit = AsyncMock(return_value=None)
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=lookup_retry_circuit,
+        persist_retry_circuit=persist_retry_circuit,
+    )
+    selection = http_bridge_helpers_module._http_bridge_retry_circuit_attempt_selection_for_pending_requests(
+        (request_state,)
+    )
+
+    assert selection.kind == "ineligible"
+    assert selection.attempt is None
+    assert (
+        await service._record_http_bridge_retry_circuit_failure_for_attempt_selection(
+            session,
+            detail="stream_idle_timeout",
+            selection=selection,
+        )
+        is None
+    )
+    assert session.key not in cast(Any, service)._http_bridge_retry_circuits
+    assert attempt.retry_circuit_failure_recorded is False
+    lookup_retry_circuit.assert_not_awaited()
+    persist_retry_circuit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_multiple_recorded_attempts_report_live_count_without_increment() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-attempt-recorded-selection")
+    first_request = _make_eventless_http_bridge_owner(request_id="req-attempt-recorded-first")
+    second_request = _make_eventless_http_bridge_owner(request_id="req-attempt-recorded-second")
+    first_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    second_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    first_request.response_create_attempt = first_attempt
+    second_request.response_create_attempt = second_attempt
+    persist_retry_circuit = AsyncMock(return_value=None)
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(return_value=None),
+        persist_retry_circuit=persist_retry_circuit,
+    )
+    assert (
+        await service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=first_attempt,
+        )
+        == 1
+    )
+    assert (
+        await service._record_http_bridge_retry_circuit_failure(
+            session,
+            detail="stream_idle_timeout",
+            attempt=second_attempt,
+        )
+        == 2
+    )
+    selection = http_bridge_helpers_module._http_bridge_retry_circuit_attempt_selection_for_pending_requests(
+        (first_request, second_request)
+    )
+
+    assert selection.kind == "recorded"
+    assert selection.ambiguous is True
+    assert (
+        await service._record_http_bridge_retry_circuit_failure_for_attempt_selection(
+            session,
+            detail="stream_idle_timeout",
+            selection=selection,
+        )
+        == 2
+    )
+    assert cast(Any, service)._http_bridge_retry_circuits[session.key].consecutive_failures == 2
+    assert persist_retry_circuit.await_count == 2
+
+
 @pytest.mark.parametrize(
     ("error_code", "expected_ambiguous"),
     [
@@ -26722,6 +27489,7 @@ async def test_http_bridge_repeated_zero_event_idle_timeouts_poison_anchor_with_
         session,
         detail="repeated_zero_event_idle_timeout",
         response_events_seen=0,
+        retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
 
 
@@ -26806,6 +27574,7 @@ async def test_http_bridge_eventless_timeout_force_retires_with_admission_waiter
         detail="missing_response_created_timeout",
         response_events_seen=0,
         retired_request_count=0,
+        retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
     fail_pending_await_args = fail_pending.await_args
     assert fail_pending_await_args is not None
@@ -26835,6 +27604,7 @@ async def test_http_bridge_reader_failure_retires_without_waiters_when_notificat
         detail="stream_incomplete",
         response_events_seen=0,
         retired_request_count=0,
+        retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
 
 
@@ -28355,6 +29125,67 @@ async def test_fail_stale_http_bridge_pending_requests_quarantines_wedged_gate_h
     # The wedged holder saw response events, so the eventless retry circuit
     # is deliberately not charged for it.
     record_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fail_stale_http_bridge_pending_requests_captures_attempt_before_pending_lock_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = _make_eventless_http_bridge_owner(request_id="req-stale-attempt-snapshot")
+    original_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=1)
+    replacement_attempt = proxy_support_module._HTTPBridgeResponseCreateAttempt(ordinal=2)
+    request_state.response_create_attempt = original_attempt
+    session = _make_bridge_session(
+        key_value="stale-attempt-snapshot",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    attempt_captured = asyncio.Event()
+    original_selector = (
+        http_bridge_request_submit_module._http_bridge_retry_circuit_attempt_selection_for_pending_requests
+    )
+
+    def capture_attempt_before_lock(
+        request_states: list[proxy_service._WebSocketRequestState],
+    ) -> proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection:
+        selection = original_selector(request_states)
+        attempt_captured.set()
+        return selection
+
+    monkeypatch.setattr(
+        http_bridge_request_submit_module,
+        "_http_bridge_retry_circuit_attempt_selection_for_pending_requests",
+        capture_attempt_before_lock,
+    )
+    record_failure = AsyncMock(return_value=1)
+    monkeypatch.setattr(
+        service,
+        "_record_http_bridge_retry_circuit_failure_for_attempt_selection",
+        record_failure,
+    )
+    monkeypatch.setattr(service, "_fail_pending_websocket_requests", AsyncMock())
+
+    async with session.pending_lock:
+        fail_task = asyncio.create_task(
+            service._fail_stale_http_bridge_pending_requests(
+                session,
+                [request_state],
+                detail="response_create_gate_timeout_stuck_pending",
+            )
+        )
+        await asyncio.wait_for(attempt_captured.wait(), timeout=0.5)
+        request_state.response_create_attempt = replacement_attempt
+
+    await asyncio.wait_for(fail_task, timeout=0.5)
+
+    record_failure.assert_awaited_once()
+    record_failure_call = record_failure.await_args
+    assert record_failure_call is not None
+    selection = record_failure_call.kwargs["selection"]
+    assert selection.kind == "eligible"
+    assert selection.attempt is original_attempt
+    assert replacement_attempt.retry_circuit_failure_recorded is False
 
 
 @pytest.mark.asyncio

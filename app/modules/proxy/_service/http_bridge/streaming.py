@@ -86,6 +86,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_request_needs_unanchored_handoff,
     _http_bridge_request_stage,
     _http_bridge_requires_cluster_registration,
+    _http_bridge_retry_circuit_attempt_selection_for_pending_requests,
     _http_bridge_runtime_config,
     _http_bridge_should_attempt_local_bootstrap_rebind,
     _http_bridge_should_attempt_local_previous_response_recovery,
@@ -4014,6 +4015,9 @@ class _HTTPBridgeStreamingMixin:
                         if not completed_delivery_in_progress:
                             keepalive_count += 1
                         if not completed_delivery_in_progress and keepalive_count >= max_keepalive_count:
+                            timed_out_retry_circuit_attempt_selection = (
+                                _http_bridge_retry_circuit_attempt_selection_for_pending_requests((request_state,))
+                            )
                             if not response_started:
                                 retried = False
                                 if not circuit_keepalive_waiting:
@@ -4204,9 +4208,10 @@ class _HTTPBridgeStreamingMixin:
                                             if keepalive_event is not None:
                                                 yield keepalive_event
                                             continue
-                                        await self._record_http_bridge_retry_circuit_failure(
+                                        await self._record_http_bridge_retry_circuit_failure_for_attempt_selection(
                                             session,
                                             detail="stream_idle_timeout",
+                                            selection=timed_out_retry_circuit_attempt_selection,
                                         )
                                         if PROMETHEUS_AVAILABLE and stream_idle_timeout_total is not None:
                                             stream_idle_timeout_total.labels(surface="http_bridge").inc()

@@ -779,7 +779,15 @@ def _make_bridge_session(
             kind=proxy_service.StickySessionKind.CODEX_SESSION,
         ),
         request_model="gpt-5.2",
-        account=cast(Any, SimpleNamespace(id="acc-bridge", status=AccountStatus.ACTIVE, plan_type="plus")),
+        account=cast(
+            Any,
+            SimpleNamespace(
+                id="acc-bridge",
+                chatgpt_account_id="workspace-bridge",
+                status=AccountStatus.ACTIVE,
+                plan_type="plus",
+            ),
+        ),
         upstream=cast(UpstreamWebSocket, SimpleNamespace(close=AsyncMock())),
         upstream_control=proxy_service._WebSocketUpstreamControl(),
         pending_requests=pending_requests or deque(),
@@ -5358,6 +5366,7 @@ async def test_http_bridge_relay_publishes_live_rate_limit_events(
 
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     session = _make_bridge_session(key_value="bridge-live-rate-limits")
+    session.account.chatgpt_account_id = "workspace-bridge-live-rate-limits"
     rate_limit_text = (
         '{"type":"codex.rate_limits","rate_limits":{"primary":'
         '{"used_percent":72,"window_minutes":300,"reset_at":1700000300}}}'
@@ -5381,9 +5390,11 @@ async def test_http_bridge_relay_publishes_live_rate_limit_events(
     monkeypatch.setattr(service, "_fail_http_bridge_reader_and_maybe_retire", AsyncMock())
     monkeypatch.setattr(service, "_fail_pending_websocket_requests", AsyncMock())
 
-    captured: list[tuple[Any, str | None]] = []
+    captured: list[tuple[Any, str | None, str | None]] = []
     live_hub.register_live_usage_publisher(
-        lambda snapshot, *, account_id=None, chatgpt_account_id=None: captured.append((snapshot, account_id))
+        lambda snapshot, *, account_id=None, chatgpt_account_id=None: captured.append(
+            (snapshot, account_id, chatgpt_account_id)
+        )
     )
     try:
         await service._relay_http_bridge_upstream_messages(session)
@@ -5391,8 +5402,8 @@ async def test_http_bridge_relay_publishes_live_rate_limit_events(
         live_hub.register_live_usage_publisher(None)
 
     assert len(captured) == 1
-    snapshot, account_id = captured[0]
-    assert account_id == session.account.id
+    snapshot, account_id, chatgpt_account_id = captured[0]
+    assert (account_id, chatgpt_account_id) == (session.account.id, session.account.chatgpt_account_id)
     assert snapshot.primary is not None
     assert snapshot.primary.used_percent == pytest.approx(72.0)
 

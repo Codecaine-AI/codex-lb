@@ -63,7 +63,7 @@ from app.db.models import Account, AccountStatus, ModelSource, StickySessionKind
 from app.modules.accounts import auth_manager as auth_manager_module
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
-from app.modules.api_keys.service import ApiKeyData
+from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
 from app.modules.proxy import affinity as proxy_affinity
 from app.modules.proxy import api as proxy_api
 from app.modules.proxy import request_policy as proxy_request_policy
@@ -11738,6 +11738,89 @@ async def test_stream_once_marks_downstream_cancel_after_visible_event(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_stream_once_keeps_first_terminal_frame_success_after_downstream_close(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_stream_first_terminal_close")
+    settlement = proxy_service._StreamSettlement()
+    completed_line = (
+        'data: {"type":"response.completed","response":{"id":"resp_first_terminal_close","status":"completed"}}\n\n'
+    )
+
+    async def fake_stream(
+        payload,
+        headers,
+        access_token,
+        account_id,
+        base_url=None,
+        raise_for_status=False,
+        enforce_openai_sdk_contract=True,
+    ):
+        del payload, headers, access_token, account_id, base_url, raise_for_status, enforce_openai_sdk_contract
+        yield completed_line
+
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "hi", "input": [], "stream": True})
+    stream = service._stream_once(
+        account,
+        payload,
+        {"session_id": "sid-stream"},
+        "req_stream_first_terminal_close",
+        False,
+        request_started_at=0.0,
+        api_key=None,
+        api_key_reservation=None,
+        settlement=settlement,
+        suppress_text_done_events=False,
+        upstream_stream_transport=None,
+        request_transport="http",
+    )
+
+    first_chunk = await anext(stream)
+    assert "event: response.completed" in first_chunk
+    assert '"id":"resp_first_terminal_close"' in first_chunk
+    await cast(Any, stream).aclose()
+
+    assert settlement.status == "success"
+    assert settlement.error is None
+    assert settlement.account_health_error is False
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+    assert request_logs.calls[0]["status"] == "success"
+    assert request_logs.calls[0]["error_code"] is None
+    assert request_logs.calls[0]["request_id"] == "resp_first_terminal_close"
+
+
+@pytest.mark.asyncio
+async def test_streaming_retry_cleanup_helper_finishes_task_before_reporting_cancellation():
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def cleanup() -> str:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        cleanup_finished.set()
+        return "settled"
+
+    cleanup_task = asyncio.create_task(cleanup())
+    waiter_task = asyncio.create_task(streaming_retry_module._await_task_deferring_cancellation(cleanup_task))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+    waiter_task.cancel()
+    await asyncio.sleep(0)
+    assert not cleanup_task.done()
+    assert not waiter_task.done()
+
+    release_cleanup.set()
+    result, cancellation = await asyncio.wait_for(waiter_task, timeout=1)
+
+    assert result == "settled"
+    assert cancellation is not None
+    assert cleanup_finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_stream_once_marks_downstream_cancel_before_first_event(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -15697,6 +15780,73 @@ async def test_stream_responses_post_yield_upstream_error_emits_terminal_failure
 
 
 @pytest.mark.asyncio
+async def test_stream_with_retry_finalizes_generated_terminal_failure_before_downstream_close(monkeypatch):
+    settings = _make_proxy_settings()
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    account = _make_account("acc_retry_generated_terminal_close")
+    record_error = AsyncMock()
+    record_success = AsyncMock()
+    settle_stream_usage = AsyncMock(return_value=True)
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_retry_generated_terminal_close",
+        key_id="key_retry_generated_terminal_close",
+        model="gpt-5.1",
+    )
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(streaming_retry_module.ProcessNetworkRecovery, "wait", AsyncMock(return_value=None))
+    monkeypatch.setattr(service._load_balancer, "record_error", record_error)
+    monkeypatch.setattr(service._load_balancer, "record_success", record_success)
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", settle_stream_usage)
+    monkeypatch.setattr(
+        service,
+        "_select_account_with_budget_compatible",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
+    )
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(return_value=account))
+
+    async def fake_stream_once(*args: object, **kwargs: object):
+        settlement = cast(proxy_service._StreamSettlement, kwargs["settlement"])
+        settlement.downstream_visible = True
+        settlement.response_id = "resp_retry_generated_terminal_close"
+        yield (
+            'data: {"type":"response.created","response":{"id":"resp_retry_generated_terminal_close",'
+            '"status":"in_progress","output":[]}}\n\n'
+        )
+        raise streaming_retry_module._TransientStreamError(
+            "upstream_unavailable",
+            {"message": "transport exploded after first event"},
+        )
+
+    monkeypatch.setattr(service, "_stream_once", fake_stream_once)
+
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True})
+    stream = service._stream_with_retry(
+        payload,
+        {"session_id": "sid-retry-generated-terminal-close"},
+        codex_session_affinity=False,
+        propagate_http_errors=False,
+        openai_cache_affinity=False,
+        api_key=None,
+        api_key_reservation=reservation,
+        suppress_text_done_events=False,
+        request_transport="http",
+        upstream_stream_transport_override=None,
+    )
+
+    first_chunk = await anext(stream)
+    terminal_chunk = await anext(stream)
+    assert "response.created" in first_chunk
+    assert "response.failed" in terminal_chunk
+    await cast(Any, stream).aclose()
+
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+    settle_stream_usage.assert_awaited_once()
+    record_success.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stream_responses_first_event_connection_reset_surfaces_without_replay(monkeypatch):
     settings = _make_proxy_settings()
     request_logs = _RequestLogsRecorder()
@@ -16002,7 +16152,10 @@ async def test_stream_responses_visible_upstream_unavailable_with_response_id_do
     assert event["response"]["id"] == "resp_reset_event"
     assert event["response"]["error"]["code"] == "upstream_unavailable"
     assert seen_excluded_account_ids == [set()]
-    assert request_logs.calls == []
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+    assert request_logs.calls[0]["status"] == "error"
+    assert request_logs.calls[0]["account_id"] == account_a.id
+    assert request_logs.calls[0]["error_code"] == "upstream_unavailable"
     record_error.assert_not_awaited()
     record_errors.assert_not_awaited()
     record_success.assert_not_awaited()

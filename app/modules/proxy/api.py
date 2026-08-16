@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from json import JSONDecodeError
-from typing import Any, Final, Literal, Protocol, cast
+from typing import Any, Final, Literal, Protocol, TypeVar, cast
 from uuid import uuid4
 
 import anyio
@@ -294,6 +294,7 @@ from app.modules.usage.repository import AdditionalUsageRepository, UsageReposit
 from app.modules.usage.updater import UsageUpdater
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 _REASONING_SUMMARY_DELTA_TYPES = frozenset({"response.reasoning_summary_text.delta"})
 _REASONING_SUMMARY_DONE_TYPES = frozenset(
@@ -2060,15 +2061,28 @@ async def _rate_limit_headers_for_request(
 async def _release_reservation_deferring_cancellation(
     reservation: ApiKeyUsageReservationData,
 ) -> None:
+    await _await_cleanup_deferring_cancellation(_release_reservation(reservation))
+
+
+async def _await_result_deferring_cancellation(awaitable: Awaitable[_T]) -> tuple[_T, bool]:
+    """Finish an owned awaitable despite repeated cancellation and report whether cancellation arrived."""
+
+    task = asyncio.ensure_future(awaitable)
+    cancellation_deferred = False
     with anyio.CancelScope(shield=True):
-        task = asyncio.create_task(_release_reservation(reservation))
         while True:
             try:
-                await asyncio.shield(task)
-                return
+                return await asyncio.shield(task), cancellation_deferred
             except asyncio.CancelledError:
                 if task.cancelled():
                     raise
+                cancellation_deferred = True
+
+
+async def _await_cleanup_deferring_cancellation(awaitable: Awaitable[object]) -> None:
+    """Finish a required cleanup operation despite repeated cancellation delivery."""
+
+    await _await_result_deferring_cancellation(awaitable)
 
 
 async def _rate_limit_headers_with_reservation_cleanup(
@@ -4736,6 +4750,36 @@ async def _source_chat_completion_response(
                 upstream_status_code=exc.upstream_status_code,
             )
             return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+        except asyncio.CancelledError:
+            release_exc: BaseException | None = None
+            if reservation is not None:
+                try:
+                    await _release_reservation_deferring_cancellation(reservation)
+                except BaseException as exc:
+                    release_exc = exc
+            await _await_cleanup_deferring_cancellation(
+                _log_source_chat_completion(
+                    request,
+                    source=source,
+                    api_key=api_key,
+                    model=model,
+                    status="cancelled",
+                    error_code="client_disconnected",
+                    error_message="client disconnected during source stream setup",
+                )
+            )
+            if release_exc is not None:
+                logger.warning(
+                    "Failed to release source stream setup reservation after client disconnect source_id=%s model=%s",
+                    source.id,
+                    model,
+                    exc_info=release_exc,
+                )
+            raise
+        except BaseException:
+            if reservation is not None:
+                await _release_reservation_deferring_cancellation(reservation)
+            raise
         if _reservation_requires_usage(reservation):
             return await _buffered_limited_source_chat_stream_response(
                 request,
@@ -4777,6 +4821,36 @@ async def _source_chat_completion_response(
             upstream_status_code=exc.upstream_status_code,
         )
         return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+    except asyncio.CancelledError:
+        release_exc: BaseException | None = None
+        if reservation is not None:
+            try:
+                await _release_reservation_deferring_cancellation(reservation)
+            except BaseException as exc:
+                release_exc = exc
+        await _await_cleanup_deferring_cancellation(
+            _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="cancelled",
+                error_code="client_disconnected",
+                error_message="client disconnected during source request setup",
+            )
+        )
+        if release_exc is not None:
+            logger.warning(
+                "Failed to release source request setup reservation after client disconnect source_id=%s model=%s",
+                source.id,
+                model,
+                exc_info=release_exc,
+            )
+        raise
+    except BaseException:
+        if reservation is not None:
+            await _release_reservation_deferring_cancellation(reservation)
+        raise
 
     if result.usage is None and _reservation_requires_usage(reservation):
         await _release_reservation(reservation)
@@ -4797,34 +4871,60 @@ async def _source_chat_completion_response(
         )
         return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
 
-    settled = await _settle_source_reservation(reservation, source=source, model=model, usage=result.usage)
-    if not settled:
-        await _log_source_chat_completion(
-            request,
-            source=source,
-            api_key=api_key,
-            model=model,
-            status="error",
-            error_code="usage_settlement_failed",
-            error_message="source usage settlement failed",
-            upstream_status_code=result.upstream_status_code,
+    settled, settlement_deferred_cancellation = await _await_result_deferring_cancellation(
+        _settle_source_reservation(reservation, source=source, model=model, usage=result.usage)
+    )
+    if settlement_deferred_cancellation:
+        await _await_cleanup_deferring_cancellation(
+            _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="cancelled",
+                usage=result.usage,
+                timings=result.timings,
+                error_code="client_disconnected",
+                error_message="client disconnected during source usage settlement",
+                upstream_status_code=result.upstream_status_code,
+            )
         )
+        raise asyncio.CancelledError
+    if not settled:
+        _, log_deferred_cancellation = await _await_result_deferring_cancellation(
+            _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="error",
+                error_code="usage_settlement_failed",
+                error_message="source usage settlement failed",
+                upstream_status_code=result.upstream_status_code,
+            )
+        )
+        if log_deferred_cancellation:
+            raise asyncio.CancelledError
         return _logged_error_json_response(
             request,
             502,
             _source_usage_settlement_failed_error(),
             headers=rate_limit_headers,
         )
-    await _log_source_chat_completion(
-        request,
-        source=source,
-        api_key=api_key,
-        model=model,
-        status="success",
-        usage=result.usage,
-        timings=result.timings,
-        upstream_status_code=result.upstream_status_code,
+    _, log_deferred_cancellation = await _await_result_deferring_cancellation(
+        _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="success",
+            usage=result.usage,
+            timings=result.timings,
+            upstream_status_code=result.upstream_status_code,
+        )
     )
+    if log_deferred_cancellation:
+        raise asyncio.CancelledError
     return JSONResponse(content=result.payload, status_code=200, headers=rate_limit_headers)
 
 
@@ -4870,13 +4970,44 @@ async def _buffered_limited_source_chat_stream_response(
                 error_message="source stream buffer limit exceeded",
             )
             return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancel_exc:
         # Starlette cancels this task when the downstream client disconnects;
         # CancelledError is a BaseException, so without this branch the
         # reservation would stay charged until stale-reservation cleanup.
-        await _aclose_stream(stream)
-        await _release_reservation(reservation)
-        raise
+        close_exc: BaseException | None = None
+        release_exc: BaseException | None = None
+        try:
+            await _await_cleanup_deferring_cancellation(_aclose_stream(stream))
+        except BaseException as exc:
+            close_exc = exc
+        if reservation is not None:
+            try:
+                await _release_reservation_deferring_cancellation(reservation)
+            except BaseException as exc:
+                release_exc = exc
+        await _await_cleanup_deferring_cancellation(
+            _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="cancelled",
+                usage=usage_holder.usage,
+                timings=usage_holder.timings,
+                error_code="client_disconnected",
+                error_message="client disconnected during source stream buffering",
+            )
+        )
+        if release_exc is not None:
+            logger.warning(
+                "Failed to release buffered source stream reservation after client disconnect source_id=%s model=%s",
+                source.id,
+                model,
+                exc_info=release_exc,
+            )
+        if close_exc is not None:
+            raise close_exc
+        raise cancel_exc
     except ModelSourceForwardingError as exc:
         await _release_reservation(reservation)
         await _log_source_chat_completion(
@@ -4926,32 +5057,57 @@ async def _buffered_limited_source_chat_stream_response(
         )
         return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
 
-    settled = await _settle_source_reservation(reservation, source=source, model=model, usage=usage_holder.usage)
-    if not settled:
-        await _log_source_chat_completion(
-            request,
-            source=source,
-            api_key=api_key,
-            model=model,
-            status="error",
-            error_code="usage_settlement_failed",
-            error_message="source usage settlement failed",
+    settled, settlement_deferred_cancellation = await _await_result_deferring_cancellation(
+        _settle_source_reservation(reservation, source=source, model=model, usage=usage_holder.usage)
+    )
+    if settlement_deferred_cancellation:
+        await _await_cleanup_deferring_cancellation(
+            _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="cancelled",
+                usage=usage_holder.usage,
+                timings=usage_holder.timings,
+                error_code="client_disconnected",
+                error_message="client disconnected during source stream usage settlement",
+            )
         )
+        raise asyncio.CancelledError
+    if not settled:
+        _, log_deferred_cancellation = await _await_result_deferring_cancellation(
+            _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="error",
+                error_code="usage_settlement_failed",
+                error_message="source usage settlement failed",
+            )
+        )
+        if log_deferred_cancellation:
+            raise asyncio.CancelledError
         return _logged_error_json_response(
             request,
             502,
             _source_usage_settlement_failed_error(),
             headers=rate_limit_headers,
         )
-    await _log_source_chat_completion(
-        request,
-        source=source,
-        api_key=api_key,
-        model=model,
-        status="success",
-        usage=usage_holder.usage,
-        timings=usage_holder.timings,
+    _, log_deferred_cancellation = await _await_result_deferring_cancellation(
+        _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="success",
+            usage=usage_holder.usage,
+            timings=usage_holder.timings,
+        )
     )
+    if log_deferred_cancellation:
+        raise asyncio.CancelledError
 
     async def body() -> AsyncIterator[bytes]:
         for chunk in chunks:
@@ -4991,8 +5147,11 @@ async def _source_chat_stream_with_settlement(
         status = "cancelled"
         error_code = "client_disconnected"
         error_message = "client disconnected before stream completed"
-        await _aclose_stream(stream)
-        await _release_reservation(reservation)
+        try:
+            await _await_cleanup_deferring_cancellation(_aclose_stream(stream))
+        finally:
+            if reservation is not None:
+                await _release_reservation_deferring_cancellation(reservation)
         raise
     except ModelSourceForwardingError as exc:
         status = "error"
@@ -5007,7 +5166,14 @@ async def _source_chat_stream_with_settlement(
         await _release_reservation(reservation)
         raise
     else:
-        settled = await _settle_source_reservation(reservation, source=source, model=model, usage=usage_holder.usage)
+        settled, settlement_deferred_cancellation = await _await_result_deferring_cancellation(
+            _settle_source_reservation(reservation, source=source, model=model, usage=usage_holder.usage)
+        )
+        if settlement_deferred_cancellation:
+            status = "cancelled"
+            error_code = "client_disconnected"
+            error_message = "client disconnected during source usage settlement"
+            raise asyncio.CancelledError
         if not settled:
             status = "error"
             error_code = "usage_settlement_failed"
@@ -5023,17 +5189,19 @@ async def _source_chat_stream_with_settlement(
                 model,
             )
     finally:
-        await _log_source_chat_completion(
-            request,
-            source=source,
-            api_key=api_key,
-            model=model,
-            status=status,
-            usage=usage_holder.usage,
-            timings=usage_holder.timings,
-            error_code=error_code,
-            error_message=error_message,
-            upstream_status_code=None,
+        await _await_cleanup_deferring_cancellation(
+            _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status=status,
+                usage=usage_holder.usage,
+                timings=usage_holder.timings,
+                error_code=error_code,
+                error_message=error_message,
+                upstream_status_code=None,
+            )
         )
 
 

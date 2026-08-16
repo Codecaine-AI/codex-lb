@@ -2924,11 +2924,14 @@ class _WebSocketMixin:
         # exactly, including the enforced-model substitution here and the
         # fast-mode correction after enforcement below.
         raw_source_model = effective_model_for_api_key(refreshed_api_key, responses_payload.model)
+        # The effort the normalizer replaced is discarded here on purpose: the
+        # WebSocket transport never reaches a model source, so the rewrite that
+        # works around the backend hang must stick.
         service_tier_was_enforced = apply_api_key_enforcement(
             responses_payload,
             refreshed_api_key,
             prohibit_fast_mode=prohibit_fast_mode,
-        )
+        ).service_tier_was_enforced
         if prohibit_fast_mode and model_alias_requests_fast_mode(raw_source_model):
             raw_source_model = responses_payload.model
         apply_enforced_service_tier_model_fallback(

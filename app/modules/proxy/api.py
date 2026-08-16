@@ -250,6 +250,7 @@ from app.modules.proxy.request_policy import (
     openai_validation_error,
     resolve_model_alias,
     responses_source_route_excluded,
+    restore_source_reasoning_effort,
     sanitize_source_chat_payload,
     strip_terminal_compaction_trigger_input,
     validate_model_access,
@@ -1070,9 +1071,11 @@ async def responses(
         return _logged_error_json_response(request, 400, error)
 
     raw_source_model = _effective_optional_model_for_api_key(api_key, responses_payload.model)
-    prohibit_fast_mode, service_tier_was_enforced = await _apply_api_key_enforcement_with_fast_mode_policy(
-        responses_payload, api_key
-    )
+    (
+        prohibit_fast_mode,
+        service_tier_was_enforced,
+        pre_normalization_effort,
+    ) = await _apply_api_key_enforcement_with_fast_mode_policy(responses_payload, api_key)
     if prohibit_fast_mode and _is_fast_mode_model_alias(raw_source_model):
         raw_source_model = responses_payload.model
     validate_model_access(api_key, responses_payload.model)
@@ -1108,6 +1111,7 @@ async def responses(
             source=source,
             api_key=api_key,
             rate_limit_headers=rate_limit_headers,
+            pre_normalization_effort=pre_normalization_effort,
         )
 
     apply_enforced_service_tier_model_fallback(
@@ -1219,9 +1223,11 @@ async def v1_responses(
         error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error)
     raw_source_model = _effective_optional_model_for_api_key(api_key, responses_payload.model)
-    prohibit_fast_mode, service_tier_was_enforced = await _apply_api_key_enforcement_with_fast_mode_policy(
-        responses_payload, api_key
-    )
+    (
+        prohibit_fast_mode,
+        service_tier_was_enforced,
+        pre_normalization_effort,
+    ) = await _apply_api_key_enforcement_with_fast_mode_policy(responses_payload, api_key)
     if prohibit_fast_mode and _is_fast_mode_model_alias(raw_source_model):
         raw_source_model = responses_payload.model
     validate_model_access(api_key, responses_payload.model)
@@ -1252,6 +1258,7 @@ async def v1_responses(
             source=source,
             api_key=api_key,
             rate_limit_headers=rate_limit_headers,
+            pre_normalization_effort=pre_normalization_effort,
         )
     apply_enforced_service_tier_model_fallback(
         responses_payload,
@@ -2030,14 +2037,18 @@ async def _hide_upstream_quota_for_api_key_clients(api_key: ApiKeyData | None) -
 async def _apply_api_key_enforcement_with_fast_mode_policy(
     payload: ResponsesRequest | ResponsesCompactRequest,
     api_key: ApiKeyData | None,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, str | None]:
     prohibit_fast_mode = await _prohibit_fast_mode_enabled()
-    service_tier_was_enforced = apply_api_key_enforcement(
+    enforcement = apply_api_key_enforcement(
         payload,
         api_key,
         prohibit_fast_mode=prohibit_fast_mode,
     )
-    return prohibit_fast_mode, service_tier_was_enforced
+    return (
+        prohibit_fast_mode,
+        enforcement.service_tier_was_enforced,
+        enforcement.pre_normalization_reasoning_effort,
+    )
 
 
 async def _prohibit_fast_mode_enabled() -> bool:
@@ -3793,6 +3804,9 @@ def _is_codex_backend_catalog_model(model: UpstreamModel) -> bool:
     return model.raw.get("shell_type") == "shell_command"
 
 
+_CODEX_WIRE_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+
+
 def _codex_model_truncation_policy(model: UpstreamModel) -> CodexTruncationPolicy:
     if "truncation_policy" in model.raw:
         try:
@@ -3810,8 +3824,24 @@ def _codex_model_experimental_supported_tools(model: UpstreamModel) -> list[str]
     return [tool for tool in tools if isinstance(tool, str)]
 
 
+def _codex_wire_reasoning_levels(model: UpstreamModel) -> list[ReasoningLevelSchema]:
+    return [
+        ReasoningLevelSchema(effort=level.effort, description=level.description)
+        for level in model.supported_reasoning_levels
+        if level.effort in _CODEX_WIRE_REASONING_EFFORTS
+    ]
+
+
+def _codex_wire_default_reasoning_level(model: UpstreamModel) -> str | None:
+    default = model.default_reasoning_level
+    if default in _CODEX_WIRE_REASONING_EFFORTS:
+        return default
+    return None
+
+
 def _to_codex_model_entry(model: UpstreamModel, *, visibility: str | None = None) -> CodexModelEntry:
     raw = model.raw
+    reasoning_levels = _codex_wire_reasoning_levels(model)
 
     extra: dict[str, JsonValue] = {}
     skip_keys = {
@@ -3850,11 +3880,8 @@ def _to_codex_model_entry(model: UpstreamModel, *, visibility: str | None = None
         display_name=model.display_name,
         description=model.description,
         base_instructions=model.base_instructions,
-        default_reasoning_level=model.default_reasoning_level,
-        supported_reasoning_levels=[
-            ReasoningLevelSchema(effort=rl.effort, description=rl.description)
-            for rl in model.supported_reasoning_levels
-        ],
+        default_reasoning_level=_codex_wire_default_reasoning_level(model),
+        supported_reasoning_levels=reasoning_levels,
         supported_in_api=model.supported_in_api,
         priority=model.priority,
         minimal_client_version=model.minimal_client_version,
@@ -3917,8 +3944,8 @@ def _v1_model_capabilities(model: UpstreamModel) -> dict[str, JsonValue]:
 def _v1_supports_reasoning(model: UpstreamModel) -> bool:
     if bool(model.supported_reasoning_levels) or model.supports_reasoning_summaries:
         return True
-    # OpenAI-compatible source models advertise no reasoning levels; their
-    # catalog entries opt in via raw metadata so /v1/models reflects reality.
+    # Source models whose operator declared no levels and no summary support
+    # opt in via raw metadata instead, so /v1/models reflects reality.
     return model.raw.get("supports_reasoning") is True
 
 
@@ -4047,7 +4074,11 @@ async def v1_chat_completions(
     except ValidationError as exc:
         error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error, headers=rate_limit_headers)
-    prohibit_fast_mode, service_tier_was_enforced = await _apply_api_key_enforcement_with_fast_mode_policy(
+    # The replaced effort is discarded: the enforced Responses payload built
+    # here is only ever forwarded to a subscription. This endpoint does
+    # source-route, but that branch forwards the untouched original chat
+    # payload, so there is nothing for a restore to undo.
+    prohibit_fast_mode, service_tier_was_enforced, _ = await _apply_api_key_enforcement_with_fast_mode_policy(
         responses_payload, api_key
     )
     if prohibit_fast_mode and _is_fast_mode_model_alias(effective_model):
@@ -4407,7 +4438,16 @@ async def _source_responses_response(
     source: ModelSource,
     api_key: ApiKeyData | None,
     rate_limit_headers: Mapping[str, str],
+    pre_normalization_effort: str | None,
 ) -> Response:
+    # This is the first point where the request is known to be served by a
+    # model source rather than a subscription account, so it is the only place
+    # the reasoning-effort workaround can be undone safely.
+    restore_source_reasoning_effort(
+        payload,
+        source,
+        pre_normalization_effort=pre_normalization_effort,
+    )
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
@@ -5241,7 +5281,7 @@ async def _stream_responses(
         payload,
         api_key,
         prohibit_fast_mode=prohibit_fast_mode,
-    )
+    ).service_tier_was_enforced
     if forwarded_request:
         payload.service_tier = forwarded_effective_service_tier
     else:
@@ -5692,11 +5732,13 @@ async def _collect_responses(
     prefer_http_bridge: bool = False,
     prohibit_fast_mode: bool = False,
 ) -> Response:
+    # The replaced effort is discarded: this path is subscription-only, so the
+    # rewrite that works around the backend hang must stick.
     service_tier_was_enforced = apply_api_key_enforcement(
         payload,
         api_key,
         prohibit_fast_mode=prohibit_fast_mode,
-    )
+    ).service_tier_was_enforced
     apply_enforced_service_tier_model_fallback(
         payload,
         service_tier_was_enforced=service_tier_was_enforced,
@@ -5918,11 +5960,13 @@ async def _compact_responses(
     openai_cache_affinity: bool = False,
     prohibit_fast_mode: bool = False,
 ) -> JSONResponse:
+    # The replaced effort is discarded: this path is subscription-only, so the
+    # rewrite that works around the backend hang must stick.
     service_tier_was_enforced = apply_api_key_enforcement(
         payload,
         api_key,
         prohibit_fast_mode=prohibit_fast_mode,
-    )
+    ).service_tier_was_enforced
     apply_enforced_service_tier_model_fallback(
         payload,
         service_tier_was_enforced=service_tier_was_enforced,

@@ -5,7 +5,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
@@ -227,6 +227,9 @@ class _StubStickySessionsRepository:
         # ambiguous-owner check for them.
         self.abandoned_keys: set[str] = set()
         self.scoped_abandoned_account_ids_by_key: dict[str, str] = {}
+        # Refresh-skip deadlines reported alongside the owner lookup, keyed by
+        # sticky key (see StickyOwnerLookup.refresh_skip_deadline).
+        self.refresh_skip_deadlines_by_key: dict[str, datetime] = {}
         self.deleted: list[tuple[str, StickySessionKind | None]] = []
         self.upserts: list[tuple[str, str, StickySessionKind | None]] = []
         self.insert_if_absent_calls: list[tuple[str, str, StickySessionKind]] = []
@@ -248,9 +251,17 @@ class _StubStickySessionsRepository:
         if key in self.abandoned_keys:
             return StickyOwnerLookup(account_id=None, continuity_abandoned=True)
         if self.account_ids_by_key is not None:
-            return StickyOwnerLookup(account_id=self.account_ids_by_key.get(key), continuity_abandoned=False)
+            return StickyOwnerLookup(
+                account_id=self.account_ids_by_key.get(key),
+                continuity_abandoned=False,
+                refresh_skip_deadline=self.refresh_skip_deadlines_by_key.get(key),
+            )
         del kwargs
-        return StickyOwnerLookup(account_id=self.account_id, continuity_abandoned=False)
+        return StickyOwnerLookup(
+            account_id=self.account_id,
+            continuity_abandoned=False,
+            refresh_skip_deadline=self.refresh_skip_deadlines_by_key.get(key),
+        )
 
     async def upsert(self, *args: Any, **kwargs: Any) -> Any:
         sticky_key = cast(str, args[0])
@@ -3028,6 +3039,116 @@ async def test_first_codex_thread_initializes_process_preference_once_for_later_
 
 
 @pytest.mark.asyncio
+async def test_fresh_same_owner_retention_skips_refresh_write_when_seed_exists() -> None:
+    """A hot same-owner retention whose lookup observed the row inside the
+    refresh-skip window issues no sticky write at all."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-skip-refresh")
+    assert alternate is not None
+    process_session = "process-skip-refresh"
+    process_key = _codex_session_selection_key(process_session)
+    thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "thread-skip"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {process_key: owner.id, thread_key: owner.id}
+    sticky_repo.refresh_skip_deadlines_by_key[thread_key] = datetime.now(tz=timezone.utc).replace(
+        tzinfo=None
+    ) + timedelta(seconds=10)
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    assert sticky_repo.upserts == []
+    assert sticky_repo.seeded_upserts == []
+    assert sticky_repo.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_fresh_thread_row_with_missing_seed_still_writes_and_initializes_seed() -> None:
+    """Seed initialization piggybacks on the thread retention write; a fresh
+    thread row must not suppress it while the process seed is absent."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-skip-seedless")
+    assert alternate is not None
+    process_session = "process-skip-seedless"
+    process_key = _codex_session_selection_key(process_session)
+    thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "thread-seedless"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    sticky_repo.refresh_skip_deadlines_by_key[thread_key] = datetime.now(tz=timezone.utc).replace(
+        tzinfo=None
+    ) + timedelta(seconds=10)
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    assert sticky_repo.account_ids_by_key[process_key] == owner.id
+    assert sticky_repo.seeded_upserts == [
+        (
+            thread_key,
+            owner.id,
+            StickySessionKind.PROMPT_CACHE,
+            process_key,
+            StickySessionKind.CODEX_SESSION,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_expired_refresh_skip_deadline_still_writes_through() -> None:
+    """A deadline that lapsed between lookup and persist must not suppress the
+    refresh: the skip window is revalidated at write time."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-skip-expired")
+    assert alternate is not None
+    process_session = "process-skip-expired"
+    process_key = _codex_session_selection_key(process_session)
+    thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "thread-expired"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {process_key: owner.id, thread_key: owner.id}
+    sticky_repo.refresh_skip_deadlines_by_key[thread_key] = datetime.now(tz=timezone.utc).replace(
+        tzinfo=None
+    ) - timedelta(seconds=1)
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    assert sticky_repo.upserts == [(thread_key, owner.id, StickySessionKind.PROMPT_CACHE)]
+
+
+@pytest.mark.asyncio
 async def test_required_file_owner_does_not_rewrite_existing_thread_row() -> None:
     balancer, thread_owner, file_owner, sticky_repo = _make_cap_spillover_balancer("file-pin-thread")
     assert file_owner is not None
@@ -4439,3 +4560,110 @@ async def test_api_key_fair_share_concurrent_sticky_selections_cannot_overshoot_
     # The commit re-check kept heavy at exactly its share across both paths.
     heavy_total = sum((runtime.stream_key_inflight or {}).get("heavy", 0) for runtime in balancer._runtime.values())
     assert heavy_total == 2
+
+
+@pytest.mark.asyncio
+async def test_fresh_same_owner_retention_skips_refresh_write_on_probe_admission() -> None:
+    """The recovery-probe admission path honors the refresh-skip deadline the
+    same way the non-probe persist site does: a fresh same-owner retention of
+    a due-probing pinned owner issues no sticky write."""
+    now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    healthy = _make_account("acc-probe-skip-healthy")
+    probing = _make_account("acc-probe-skip-probing")
+    key = "probe-skip-session"
+
+    def _build(sticky_repo: _StubStickySessionsRepository) -> LoadBalancer:
+        accounts_repo = _StubAccountsRepository([healthy, probing])
+        usage_repo = _StubUsageRepository(
+            primary={
+                healthy.id: _usage_row_with_percent(
+                    150,
+                    healthy.id,
+                    used_percent=30.0,
+                    reset_at=now_epoch + 300,
+                ),
+                probing.id: _usage_row_with_percent(
+                    151,
+                    probing.id,
+                    used_percent=10.0,
+                    reset_at=now_epoch + 300,
+                ),
+            },
+            secondary={},
+        )
+        balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+        balancer._runtime[probing.id] = RuntimeState(
+            health_tier=HEALTH_TIER_PROBING,
+            last_selected_at=0.0,
+            version=17,
+        )
+        return balancer
+
+    # Control: without a freshness observation the probe admission persists
+    # the retention write, proving this scenario exercises the probe branch.
+    control_repo = _StubStickySessionsRepository()
+    control_repo.account_ids_by_key = {key: probing.id}
+    control_balancer = _build(control_repo)
+    control = await control_balancer.select_account(
+        sticky_key=key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+    )
+    assert control.account is not None
+    assert control.account.id == probing.id
+    assert control_repo.upserts == [(key, probing.id, StickySessionKind.PROMPT_CACHE)]
+    await control_balancer.release_account_lease(control.lease)
+
+    skip_repo = _StubStickySessionsRepository()
+    skip_repo.account_ids_by_key = {key: probing.id}
+    skip_repo.refresh_skip_deadlines_by_key[key] = datetime.now(tz=timezone.utc).replace(tzinfo=None) + timedelta(
+        seconds=10
+    )
+    skip_balancer = _build(skip_repo)
+    selected = await skip_balancer.select_account(
+        sticky_key=key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+    )
+    assert selected.account is not None
+    assert selected.account.id == probing.id
+    assert skip_repo.upserts == []
+    assert skip_repo.deleted == []
+    # The probe reservation itself still committed: runtime advanced.
+    probing_runtime = skip_balancer._runtime[probing.id]
+    assert probing_runtime.version > 17
+    assert probing_runtime.last_selected_at is not None
+    assert probing_runtime.last_selected_at > 0.0
+    await skip_balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_fresh_thread_only_retention_without_seed_key_skips_refresh_write() -> None:
+    """Thread-only affinity (no process seed key at all) has nothing to
+    initialize, so a fresh same-owner retention skips its refresh write."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-skip-no-seedkey")
+    assert alternate is not None
+    thread_key = _codex_backend_identity({"thread-id": "thread-only-skip"}).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    sticky_repo.refresh_skip_deadlines_by_key[thread_key] = datetime.now(tz=timezone.utc).replace(
+        tzinfo=None
+    ) + timedelta(seconds=10)
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    assert sticky_repo.upserts == []
+    assert sticky_repo.seeded_upserts == []
+    assert sticky_repo.deleted == []

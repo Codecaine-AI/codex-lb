@@ -20,6 +20,7 @@ POSTGRES_PYTEST_TARGETS := \
 	tests/integration/test_db_commit_durability.py \
 	tests/test_request_logs_options_api.py \
 	tests/integration/test_account_usage_rollup.py \
+	tests/integration/test_account_deletion_background.py \
 	tests/integration/test_request_usage_time_rollup.py \
 	tests/integration/test_request_usage_rollup_parity.py \
 	tests/integration/test_migrations.py::test_request_usage_time_rollups_migration_upgrade_and_downgrade \
@@ -33,6 +34,7 @@ POSTGRES_PYTEST_TARGETS := \
 	tests/integration/test_repositories.py::test_replace_reauthorized_discards_pending_downgrade_evidence \
 	tests/integration/test_repositories.py::test_upsert_account_slot_discards_pending_downgrade_evidence_on_reimport \
 	tests/integration/test_migrations.py::test_account_plan_downgrade_observations_migration_upgrade_and_downgrade \
+	tests/integration/test_migrations.py::test_account_pending_deletion_migration_upgrade_and_downgrade \
 	tests/integration/test_usage_repository.py::test_bulk_history_since_primary_query_plan_is_index_only_postgresql \
 	tests/integration/test_usage_repository.py::test_bulk_history_since_cutoff_query_plan_is_index_only_postgresql \
 	tests/integration/test_usage_repository.py::test_bulk_history_since_secondary_query_plan_is_index_only_postgresql \

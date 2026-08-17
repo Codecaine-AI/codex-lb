@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import delete, or_, select, text, update
+from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import extract_id_token_claims, resolve_seat_identity
+from app.core.crypto import TokenEncryptor
 from app.core.upstream_proxy.cache import get_upstream_route_cache
 from app.core.utils.time import utcnow
 from app.db.account_identity_lock import advisory_lock_key, lock_postgresql_account_identities
@@ -51,6 +53,42 @@ from app.modules.usage.repository import _clear_bulk_history_since_sqlite_cache
 
 _SETTINGS_ROW_ID = 1
 _DUPLICATE_ACCOUNT_SUFFIX = "__copy"
+# deactivation_reason stamped by the fast DELETE path while the background
+# worker drains the account's rows. The authoritative pending marker is
+# accounts.delete_requested_at; the reason string is operator-facing only.
+ACCOUNT_PENDING_DELETION_REASON = "pending_deletion"
+
+
+def credentials_replaced_since_wipe(
+    access_token_encrypted: bytes,
+    refresh_token_encrypted: bytes,
+    id_token_encrypted: bytes,
+) -> bool:
+    """True when a marked account's token ciphertext is no longer the
+    empty-credential wipe stamped by :meth:`AccountsRepository.begin_delete`.
+
+    New-code credential replacements clear the pending-deletion marker in the
+    same transaction, but a replacement handled by a PRE-UPGRADE replica
+    during a rolling deploy writes fresh ciphertext without knowing the
+    marker columns. Fresh (non-wiped) credentials on a still-marked row are
+    therefore themselves the supersede signal; the caller must clear the
+    marker and abandon the deletion. ALL THREE token fields are inspected: a
+    legal replacement may carry an empty refresh token while providing fresh
+    access/id material, and mistaking it for the wipe would finalize a
+    freshly replaced account. Undecryptable material also counts as
+    replaced — never finalize a row whose credentials we cannot attribute to
+    our own wipe.
+    """
+    encryptor = TokenEncryptor()
+    for ciphertext in (access_token_encrypted, refresh_token_encrypted, id_token_encrypted):
+        try:
+            if encryptor.decrypt(ciphertext) != "":
+                return True
+        except Exception:
+            return True
+    return False
+
+
 _UNSET = object()
 _HARD_STICKY_UNAVAILABLE_STATUSES = frozenset(
     (AccountStatus.PAUSED, AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED)
@@ -160,7 +198,11 @@ class AccountsRepository:
         return result.scalar_one_or_none()
 
     async def list_accounts(self, *, refresh_existing: bool = False) -> list[Account]:
-        stmt = select(Account).order_by(Account.email)
+        # Accounts marked for background deletion are already deleted from the
+        # operator's point of view: they never appear in listings (dashboard,
+        # usage refresh, automations) even though their rows survive until the
+        # deletion worker finishes draining them.
+        stmt = select(Account).where(Account.delete_requested_at.is_(None)).order_by(Account.email)
         if refresh_existing:
             stmt = stmt.execution_options(populate_existing=True)
         result = await self._session.execute(stmt)
@@ -169,7 +211,12 @@ class AccountsRepository:
     async def list_accounts_by_ids(self, account_ids: list[str], *, refresh_existing: bool = False) -> list[Account]:
         if not account_ids:
             return []
-        stmt = select(Account).where(Account.id.in_(account_ids)).order_by(Account.email)
+        stmt = (
+            select(Account)
+            .where(Account.id.in_(account_ids))
+            .where(Account.delete_requested_at.is_(None))
+            .order_by(Account.email)
+        )
         if refresh_existing:
             stmt = stmt.execution_options(populate_existing=True)
         result = await self._session.execute(stmt)
@@ -678,7 +725,17 @@ class AccountsRepository:
             if blocked_at is not _UNSET:
                 values["blocked_at"] = blocked_at
             result = await self._session.execute(
-                update(Account).where(Account.id == account_id).values(**values).returning(Account.id)
+                update(Account)
+                .where(Account.id == account_id)
+                # An account marked for background deletion is terminal: a
+                # stale in-flight settlement (e.g. a 429 from a request that
+                # was selected before the DELETE) must not replace the
+                # DEACTIVATED/pending_deletion state and make the account
+                # selectable again mid-drain. Only a credential replacement
+                # (which clears the marker) may resurrect the row.
+                .where(Account.delete_requested_at.is_(None))
+                .values(**values)
+                .returning(Account.id)
             )
             updated_id = result.scalar_one_or_none()
             if updated_id is not None and self._hard_sticky_outage_started(previous_status, status):
@@ -694,6 +751,10 @@ class AccountsRepository:
             result = await self._session.execute(
                 update(Account)
                 .where(Account.id == account_id)
+                # Marked-for-deletion rows are gone from the operator's
+                # perspective: ID-based mutations must report not-found, as the
+                # synchronous delete did once the row was removed.
+                .where(Account.delete_requested_at.is_(None))
                 .values(security_work_authorized=enabled)
                 .returning(Account.id)
             )
@@ -726,6 +787,9 @@ class AccountsRepository:
                 update(Account)
                 .where(Account.id == account_id)
                 .where(Account.status == expected_status)
+                # Same pending-deletion fence as ``update_status``: marked
+                # rows are terminal for ordinary status writers.
+                .where(Account.delete_requested_at.is_(None))
                 .values(**values)
                 .returning(Account.id)
             )
@@ -860,7 +924,14 @@ class AccountsRepository:
     async def update_alias(self, account_id: str, alias: str | None) -> bool:
         async with sqlite_writer_section():
             result = await self._session.execute(
-                update(Account).where(Account.id == account_id).values(alias=alias).returning(Account.id)
+                update(Account)
+                .where(Account.id == account_id)
+                # Marked-for-deletion rows are gone from the operator's
+                # perspective: ID-based mutations must report not-found, as the
+                # synchronous delete did once the row was removed.
+                .where(Account.delete_requested_at.is_(None))
+                .values(alias=alias)
+                .returning(Account.id)
             )
             await self._session.commit()
             return result.scalar_one_or_none() is not None
@@ -870,6 +941,10 @@ class AccountsRepository:
             result = await self._session.execute(
                 update(Account)
                 .where(Account.id == account_id)
+                # Marked-for-deletion rows are gone from the operator's
+                # perspective: ID-based mutations must report not-found, as the
+                # synchronous delete did once the row was removed.
+                .where(Account.delete_requested_at.is_(None))
                 .values(limit_warmup_enabled=enabled)
                 .returning(Account.id)
             )
@@ -881,24 +956,211 @@ class AccountsRepository:
             result = await self._session.execute(
                 update(Account)
                 .where(Account.id == account_id)
+                # Marked-for-deletion rows are gone from the operator's
+                # perspective: ID-based mutations must report not-found, as the
+                # synchronous delete did once the row was removed.
+                .where(Account.delete_requested_at.is_(None))
                 .values(routing_policy=routing_policy)
                 .returning(Account.id)
             )
             await self._session.commit()
             return result.scalar_one_or_none() is not None
 
-    async def delete(self, account_id: str, *, delete_history: bool = False) -> bool:
+    async def begin_delete(self, account_id: str, *, delete_history: bool = False) -> bool:
+        """Mark an account for background deletion; commits in milliseconds.
+
+        Fast path of ``DELETE /api/accounts/{id}``: the account becomes
+        terminal (``DEACTIVATED`` — every serving path already excludes it)
+        and carries the pending-deletion marker that hides it from listings
+        and enqueues it for the deletion worker, which drains its bulk rows
+        in chunks and finalizes via :meth:`delete` with ``only_pending=True``.
+
+        The stored token ciphertext is overwritten with empty-credential
+        ciphertext in the same transaction: the row outlives the DELETE
+        response by the drain duration, and no reader — including a
+        pre-upgrade replica during a rolling deploy, whose export endpoints
+        do not know the marker — may still be able to produce usable
+        credentials from it. A credential replacement (the only supersede
+        path) writes fresh ciphertext, and token rotation is CAS-guarded on
+        the pre-wipe refresh ciphertext, so a stale in-flight rotation
+        misses rather than resurrecting the old material. Before the wipe,
+        the non-secret seat identity is preserved: legacy rows whose
+        ``chatgpt_user_id`` was never backfilled carry it only inside the
+        id-token claims, and targeted reauthentication — the promised
+        supersede path — verifies the seat against exactly those two
+        sources, so ``chatgpt_user_id`` is backfilled from the claims when
+        absent.
+
+        API-key account assignments are removed here as well (the FK cascade
+        used to do this when the synchronous delete removed the row), so key
+        listings and pooled-usage projections exclude the account
+        immediately; the key's ``account_assignment_scope_enabled`` flag is
+        persisted separately and keeps the key scoped.
+
+        Idempotent: a repeat request on an already-marked account succeeds
+        without changing the frozen ``delete_history`` choice (first request
+        wins — matching the synchronous behavior, where a second DELETE after
+        the first completed found nothing left to escalate).
+        """
+        # Repeat requests short-circuit BEFORE the writer section / row lock:
+        # a drain chunk holds the account row (and, on SQLite, the writer
+        # section) for up to a few seconds, and the fast-path contract is a
+        # millisecond-scale response. The unlocked read is safe because the
+        # repeat changes nothing — the first request froze the variant and
+        # the wipe/cleanup already ran — and a replacement racing this read
+        # supersedes the deletion exactly as if it landed after this
+        # response. When credentials were replaced WITHOUT clearing the
+        # marker (a pre-upgrade replica's replacement), fall through to the
+        # full path so an explicit re-delete re-wipes and re-arms.
+        marked_row = (
+            await self._session.execute(
+                select(
+                    Account.delete_requested_at,
+                    Account.access_token_encrypted,
+                    Account.refresh_token_encrypted,
+                    Account.id_token_encrypted,
+                ).where(Account.id == account_id)
+            )
+        ).first()
+        if (
+            marked_row is not None
+            and marked_row[0] is not None
+            and not credentials_replaced_since_wipe(marked_row[1], marked_row[2], marked_row[3])
+        ):
+            return True
+        encryptor = TokenEncryptor()
+        wiped_token = encryptor.encrypt("")
+        async with sqlite_writer_section():
+            seat_stmt = select(Account.chatgpt_user_id, Account.id_token_encrypted).where(Account.id == account_id)
+            if self._dialect_name() == "postgresql":
+                # Hold the row through the mark so the derived seat identity
+                # cannot go stale between this read and the update below.
+                seat_stmt = seat_stmt.with_for_update(key_share=True)
+            seat_row = (await self._session.execute(seat_stmt)).first()
+            if seat_row is None:
+                await self._session.rollback()
+                return False
+            seat_user_id: str | None = seat_row[0]
+            if seat_user_id is None:
+                try:
+                    claims = extract_id_token_claims(encryptor.decrypt(seat_row[1]))
+                    seat_user_id = resolve_seat_identity(claims, claims.auth)
+                except Exception:
+                    seat_user_id = None
+            values: dict[str, Any] = {
+                "status": AccountStatus.DEACTIVATED,
+                "deactivation_reason": ACCOUNT_PENDING_DELETION_REASON,
+                "reset_at": None,
+                "blocked_at": None,
+                "access_token_encrypted": wiped_token,
+                "refresh_token_encrypted": wiped_token,
+                "id_token_encrypted": wiped_token,
+                "delete_requested_at": func.coalesce(Account.delete_requested_at, utcnow()),
+                "delete_history_requested": case(
+                    (Account.delete_requested_at.is_(None), delete_history),
+                    else_=Account.delete_history_requested,
+                ),
+            }
+            if seat_user_id is not None:
+                values["chatgpt_user_id"] = seat_user_id
+            result = await self._session.execute(
+                update(Account).where(Account.id == account_id).values(**values).returning(Account.id)
+            )
+            updated_id = result.scalar_one_or_none()
+            if updated_id is not None:
+                # Same immediate cleanup the DEACTIVATED transition performs:
+                # sticky mappings and bridge sessions must not outlive the
+                # account's routability.
+                await self._session.execute(delete(StickySession).where(StickySession.account_id == account_id))
+                await self._close_http_bridge_sessions_for_account(account_id)
+                await self._session.execute(
+                    delete(ApiKeyAccountAssignment).where(ApiKeyAccountAssignment.account_id == account_id)
+                )
+            await self._session.commit()
+            return updated_id is not None
+
+    async def delete(
+        self,
+        account_id: str,
+        *,
+        delete_history: bool = False,
+        only_pending: bool = False,
+    ) -> bool:
         async with sqlite_writer_section():
             if self._dialect_name() == "postgresql":
                 # Identity membership precedes the fold-state lock so live
                 # settlement and deletion cannot form an identity/fold cycle.
-                await self._lock_postgresql_account_identity_membership(account_id, None)
+                locked_account = await self._lock_postgresql_account_identity_membership(account_id, None)
+                pending_state = (
+                    None
+                    if locked_account is None
+                    else (
+                        locked_account.delete_requested_at,
+                        locked_account.delete_history_requested,
+                        locked_account.access_token_encrypted,
+                        locked_account.refresh_token_encrypted,
+                        locked_account.id_token_encrypted,
+                    )
+                )
+            else:
+                pending_state = (
+                    await self._session.execute(
+                        select(
+                            Account.delete_requested_at,
+                            Account.delete_history_requested,
+                            Account.access_token_encrypted,
+                            Account.refresh_token_encrypted,
+                            Account.id_token_encrypted,
+                        ).where(Account.id == account_id)
+                    )
+                ).first()
+            if only_pending:
+                # Background finalization: a credential replacement
+                # (re-import/reauth) that cleared the marker supersedes the
+                # deletion, so touch nothing. The variant comes from the
+                # persisted flag frozen at request time, never the caller.
+                # On PostgreSQL the identity-membership row lock held above
+                # keeps the marker stable through this transaction; on SQLite
+                # the writer section serializes all writers.
+                if pending_state is None or pending_state[0] is None:
+                    await self._session.rollback()
+                    return False
+                if credentials_replaced_since_wipe(pending_state[2], pending_state[3], pending_state[4]):
+                    # A pre-upgrade replica replaced the credentials without
+                    # being able to clear marker columns its ORM does not
+                    # know. That replacement supersedes the deletion: clear
+                    # the marker (we hold the row lock) and abandon.
+                    await self._session.execute(
+                        update(Account)
+                        .where(Account.id == account_id)
+                        .values(delete_requested_at=None, delete_history_requested=False)
+                    )
+                    await self._session.commit()
+                    return False
+                delete_history = bool(pending_state[1])
             # Serialize against fold passes before touching the account's
             # request logs: without the fold-state lock an in-flight hourly
             # slice could aggregate the pre-delete attribution but commit
             # after this transaction, resurrecting the account's folded rows
             # the mirrors below just moved or removed.
             await lock_fold_state(self._session)
+            if self._dialect_name() == "postgresql":
+                # Upgrade the account row to a full FOR UPDATE lock BEFORE the
+                # raw sweeps. FOR UPDATE conflicts with the KEY SHARE taken by
+                # concurrent request-log FK inserts, so every in-flight
+                # stream's log row either commits before this point (and the
+                # sweeps below see it) or its insert blocks until this
+                # transaction commits and then fails its FK against the
+                # deleted row — the same outcome a post-delete insert always
+                # had. Without the upgrade, an insert could commit between
+                # the sweep and the account-row delete: the FK's ON DELETE
+                # SET NULL would leave a live (deleted_at IS NULL) orphan on
+                # the soft path, or surviving raw history under
+                # delete_history. Lock order (identity -> fold -> row
+                # exclusive) matches the historical transaction, where the
+                # final DELETE acquired this same exclusive lock after the
+                # fold lock.
+                await self._session.execute(select(Account.id).where(Account.id == account_id).with_for_update())
             await self._session.execute(delete(UsageHistory).where(UsageHistory.account_id == account_id))
             if delete_history:
                 await self._session.execute(delete(RequestLog).where(RequestLog.account_id == account_id))
@@ -1288,6 +1550,12 @@ def _apply_account_updates(target: Account, source: Account) -> None:
     target.deactivation_reason = source.deactivation_reason
     target.reset_at = source.reset_at
     target.blocked_at = source.blocked_at
+    # A credential replacement (re-import/reauth) supersedes a pending
+    # background deletion: clearing the marker makes the deletion worker
+    # abandon the account before finalizing (rows already drained stay
+    # detached — history loss was requested by the earlier delete).
+    target.delete_requested_at = None
+    target.delete_history_requested = False
 
 
 def _slot_lock_key(account: Account, *, preserve_unknown_workspace_duplicates: bool = True) -> str:

@@ -477,6 +477,31 @@ def _classify_upstream_close(
     return "transient"
 
 
+def _is_account_neutral_transport_drop(
+    close_code: int | None,
+    *,
+    response_events_seen: int,
+) -> bool:
+    """Return whether an upstream websocket ending is account-neutral evidence.
+
+    An abrupt transport drop that carries no close frame and arrived before
+    any application-layer response event is the weakest possible evidence of
+    account ill-health: the account never spoke at the application layer for
+    this request. Charging the account lets a few infrastructure resets push
+    it into error backoff and 502 continuity-bound follow-ups while healthy
+    pool siblings idle (issue #1754). Any close frame — even a non-clean one —
+    is upstream-authored evidence and keeps the existing penalty semantics, as
+    does a drop after response events started streaming.
+
+    Close code 1006 (abnormal closure) is reserved by RFC 6455 and can never
+    appear in an actual close frame: adapters synthesize it locally when the
+    socket dies without one (aiohttp stores 1006 on ``close_code`` for an
+    abnormal CLOSED), so it counts as frame-less here.
+    """
+
+    return close_code in (None, 1006) and response_events_seen == 0
+
+
 def _should_infer_upstream_status_from_proxy_error(exc: ProxyResponseError, upstream_error_code: str | None) -> bool:
     if exc.failure_phase == "status":
         return True

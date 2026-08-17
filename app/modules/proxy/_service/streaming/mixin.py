@@ -41,7 +41,11 @@ from app.core.errors import (
 from app.core.errors import (
     response_failed_event,
 )
-from app.core.openai.parsing import parse_sse_event_payload
+from app.core.openai.parsing import (
+    _LIFECYCLE_EVENT_TYPES,
+    classify_event_type,
+    parse_sse_event_payload,
+)
 from app.core.openai.requests import (
     ResponsesRequest,
 )
@@ -274,6 +278,7 @@ from app.modules.proxy._service.streaming.helpers import (
     _mark_downstream_stream_cancelled,
     _mark_upstream_stream_incomplete,
     _raw_stream_error_code_or_upstream,
+    _rewrite_malformed_stream_error_event,
 )
 from app.modules.proxy._service.streaming.helpers import (
     _raw_stream_error_fields as _raw_error_fields,
@@ -292,7 +297,6 @@ from app.modules.proxy._service.support import (
     _WEBSOCKET_FULL_REPLAY_WAIT_MIN_ITEMS,  # noqa: F401
     _WEBSOCKET_FULL_REPLAY_WAIT_POLL_SECONDS,  # noqa: F401
     _ApiKeyReservationTouchState,
-    _event_type_from_payload,
     _finalize_ttft_latency_ms,
     _RequestLogFailureMetadata,
     _RetryableStreamError,
@@ -609,10 +613,19 @@ class _StreamingMixin(_StreamingRetryMixin):
             await proxy._load_balancer.release_account_lease(account_response_create_lease)
             account_response_create_lease = None
             first_payload = parse_sse_data_json(first)
-            event = parse_sse_event_payload(first_payload)
-            event_type = _event_type_from_payload(event, first_payload)
+            event_type = classify_event_type(first_payload)
+            event = parse_sse_event_payload(first_payload) if event_type in _LIFECYCLE_EVENT_TYPES else None
             terminal_event_seen = False
             preserve_raw_sse_line = not enforce_openai_sdk_contract and event_type == "error"
+            malformed_error_rewrite = _rewrite_malformed_stream_error_event(
+                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                event=event,
+                event_type=event_type,
+                event_payload=first_payload,
+                response_id=response_id,
+            )
+            if malformed_error_rewrite is not None:
+                first, event, first_payload, event_type = malformed_error_rewrite
             if event_type not in {"response.completed", "response.failed", "response.incomplete", "error"}:
                 api_key_reservation_touch_state.last_touch_at = await proxy._maybe_touch_api_key_reservation(
                     api_key=api_key,
@@ -765,26 +778,18 @@ class _StreamingMixin(_StreamingRetryMixin):
                 raise terminal_stream_error
             async for line in iterator:
                 event_payload = parse_sse_data_json(line)
-                event = parse_sse_event_payload(event_payload)
-                event_type = _event_type_from_payload(event, event_payload)
+                event_type = classify_event_type(event_payload)
+                event = parse_sse_event_payload(event_payload) if event_type in _LIFECYCLE_EVENT_TYPES else None
                 preserve_raw_sse_line = not enforce_openai_sdk_contract and event_type == "error"
-                if (
-                    enforce_openai_sdk_contract
-                    and event_type == "error"
-                    and (event is None or event.error is None)
-                    and isinstance(event_payload, dict)
-                ):
-                    message_value = event_payload.get("message")
-                    message = (
-                        message_value.strip()
-                        if isinstance(message_value, str) and message_value.strip()
-                        else "Upstream error"
-                    )
-                    line, event, event_payload, event_type = _facade()._build_rewritten_stream_response_failed_event(
-                        response_id=response_id,
-                        error_code="upstream_error",
-                        error_message=message,
-                    )
+                malformed_error_rewrite = _rewrite_malformed_stream_error_event(
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                    event=event,
+                    event_type=event_type,
+                    event_payload=event_payload,
+                    response_id=response_id,
+                )
+                if malformed_error_rewrite is not None:
+                    line, event, event_payload, event_type = malformed_error_rewrite
                 if event_type not in {"response.completed", "response.failed", "response.incomplete", "error"}:
                     api_key_reservation_touch_state.last_touch_at = await proxy._maybe_touch_api_key_reservation(
                         api_key=api_key,

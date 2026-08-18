@@ -256,6 +256,7 @@ from app.modules.proxy.request_policy import (
     sanitize_source_chat_payload,
     strip_terminal_compaction_trigger_input,
     validate_model_access,
+    validate_top_level_compaction_trigger_input_shape,
 )
 from app.modules.proxy.schemas import (
     AccountPoolUsageResponse,
@@ -707,6 +708,31 @@ def _is_openai_sdk_request(
     return _accepts_event_stream(request) or payload.messages is not None
 
 
+async def _capture_raw_compaction_trigger_error(request: Request) -> None:
+    """Validate top-level compaction triggers before Pydantic normalization.
+
+    The typed request models intentionally hoist trailing system/developer
+    messages into ``instructions``. Keep that behavior for runtime parsing and
+    OpenAPI, but remember a raw trigger-placement error for the endpoint to
+    render after FastAPI has supplied the typed body.
+    """
+    try:
+        raw_payload = await request.json()
+    except (JSONDecodeError, UnicodeDecodeError, ValueError):
+        return
+    if not is_json_mapping(raw_payload):
+        return
+    try:
+        validate_top_level_compaction_trigger_input_shape(raw_payload)
+    except ClientPayloadError as exc:
+        request.state.compaction_trigger_error = exc
+
+
+def _raw_compaction_trigger_error(request: Request) -> ClientPayloadError | None:
+    error = getattr(request.state, "compaction_trigger_error", None)
+    return error if isinstance(error, ClientPayloadError) else None
+
+
 async def _thread_goal_payload_from_request(request: Request) -> dict[str, JsonValue]:
     if request.method.upper() == "GET":
         return {key: value for key, value in request.query_params.multi_items()}
@@ -1061,6 +1087,7 @@ async def responses(
     native_codex_heartbeat = _is_native_codex_request(request.headers) and not explicit_openai_sdk_marker
     openai_compat_payload = _has_openai_responses_shape(payload)
     try:
+        validate_top_level_compaction_trigger_input_shape(payload)
         responses_payload = normalize_responses_request_payload(
             payload,
             openai_compat=openai_compat_payload,
@@ -1209,12 +1236,16 @@ async def responses_websocket(
 async def v1_responses(
     request: Request,
     payload: V1ResponsesRequest = Body(...),
+    _raw_trigger_validation: None = Depends(_capture_raw_compaction_trigger_error),
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> Response:
     capability_transport_denial = await _required_capability_http_transport_denial(request, api_key)
     if capability_transport_denial is not None:
         return capability_transport_denial
+    raw_trigger_error = _raw_compaction_trigger_error(request)
+    if raw_trigger_error is not None:
+        return _logged_error_json_response(request, 400, openai_client_payload_error(raw_trigger_error))
     try:
         responses_payload = payload.to_responses_request()
         enforce_strict_text_format(responses_payload)
@@ -5369,7 +5400,14 @@ async def _stream_responses(
                     prompt_cache_key_alias = payload.model_extra.get("promptCacheKey")
                     if isinstance(prompt_cache_key_alias, str) and "prompt_cache_key" not in compact_payload_data:
                         compact_payload_data["prompt_cache_key"] = prompt_cache_key_alias
-                compact_payload_data["input"] = compact_trigger_input
+                # The main /responses route trims the terminal trigger before
+                # compaction so the compact budget and image elision see only
+                # the history to summarize. The upstream /compact contract
+                # still requires exactly one terminal trigger on the wire.
+                compact_payload_data["input"] = [
+                    *compact_trigger_input,
+                    {"type": "compaction_trigger"},
+                ]
                 if payload.previous_response_id is not None:
                     compact_payload_data["previous_response_id"] = payload.previous_response_id
                 if payload.conversation is not None:
@@ -5961,12 +5999,16 @@ async def _collect_responses(
 async def responses_compact(
     request: Request,
     payload: ResponsesCompactRequest = Body(...),
+    _raw_trigger_validation: None = Depends(_capture_raw_compaction_trigger_error),
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> JSONResponse:
     capability_transport_denial = await _required_capability_http_transport_denial(request, api_key)
     if capability_transport_denial is not None:
         return capability_transport_denial
+    raw_trigger_error = _raw_compaction_trigger_error(request)
+    if raw_trigger_error is not None:
+        return _logged_error_json_response(request, 400, openai_client_payload_error(raw_trigger_error))
     return await _compact_responses(
         request,
         payload,

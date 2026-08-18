@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any, AsyncIterator, Iterator, Literal, Protocol, Self, cast
+from typing import Any, AsyncIterator, Iterator, Literal, Self, cast
 from unittest.mock import ANY, AsyncMock, MagicMock
 from unittest.mock import call as mock_call
 
@@ -33,6 +33,7 @@ from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
 import app.core.clients.proxy as proxy_module
+import app.core.openai.requests as openai_requests_module
 import app.core.resilience.network_recovery as network_recovery_module
 import app.modules.proxy.load_balancer as load_balancer_module
 from app.core import shutdown as shutdown_state
@@ -5102,6 +5103,32 @@ class _DummyResponse(proxy_module.SSEResponseProtocol):
         self.content = _DummyContent(chunks)
 
 
+@pytest.mark.asyncio
+async def test_compact_sse_terminal_error_preserves_error_envelope() -> None:
+    response = _DummyResponse(
+        [
+            (
+                b'data: {"type":"response.failed","response":{"status_code":400,'
+                b'"error":{"code":"previous_response_not_found","message":"missing anchor",'
+                b'"param":"previous_response_id"}}}\n\n'
+            )
+        ]
+    )
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await proxy_module._compact_response_payload_from_sse(
+            response,
+            idle_timeout_seconds=1.0,
+            max_event_bytes=4096,
+        )
+
+    exc = _assert_proxy_response_error(exc_info.value)
+    assert exc.status_code == 400
+    assert _proxy_error_code(exc) == "previous_response_not_found"
+    assert _proxy_error_message(exc) == "missing anchor"
+    assert exc.payload["error"]["param"] == "previous_response_id"
+
+
 class _TranscribeResponse:
     def __init__(
         self,
@@ -6276,17 +6303,31 @@ class _JsonCompactResponse:
         return self._payload
 
 
+def _compact_sse_response(
+    *,
+    response_id: str = "resp_compact_1",
+    encrypted_content: str = "enc_summary_1",
+) -> "_SsePostResponse":
+    return _SsePostResponse(
+        [
+            (
+                b'data: {"type":"response.output_item.done","output_index":0,'
+                b'"item":{"id":"msg_compact_1","type":"message","role":"assistant",'
+                b'"status":"completed","content":[{"type":"output_text","text":"'
+                + encrypted_content.encode()
+                + b'"}]}}\n\n'
+            ),
+            (
+                b'data: {"type":"response.completed","response":{"object":"response","id":"'
+                + response_id.encode()
+                + b'","status":"completed","output":[]}}\n\n'
+            ),
+        ]
+    )
+
+
 class _CompactSession:
-    class _CompactResponseLike(Protocol):
-        status: int
-
-        async def __aenter__(self) -> Self: ...
-
-        async def __aexit__(self, exc_type: object | None, exc: BaseException | None, tb: object | None) -> bool: ...
-
-        async def json(self, *, content_type: str | None = None) -> dict[str, object]: ...
-
-    def __init__(self, response: _CompactResponseLike) -> None:
+    def __init__(self, response: object) -> None:
         self._response = response
         self.calls: list[dict[str, object]] = []
 
@@ -6320,6 +6361,7 @@ class _ThreadGoalRequestSession:
 class _SsePostResponse:
     def __init__(self, chunks: list[bytes]) -> None:
         self.status = 200
+        self.headers = {"content-type": "text/event-stream"}
         self.content = _DummyContent(chunks)
 
     async def __aenter__(self):
@@ -10456,6 +10498,8 @@ async def test_compact_responses_starts_upstream_timer_after_image_inlining(monk
         upstream_base_url = "https://chatgpt.com/backend-api"
         upstream_connect_timeout_seconds = 1.0
         upstream_compact_timeout_seconds = 12.0
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
         image_inline_fetch_enabled = True
         trace_channels = frozenset()
 
@@ -10484,11 +10528,7 @@ async def test_compact_responses_starts_upstream_timer_after_image_inlining(monk
     payload = proxy_module.ResponsesCompactRequest.model_validate(
         {"model": "gpt-5.1", "instructions": "hi", "input": [{"role": "user", "content": "hi"}]}
     )
-    session = _CompactSession(
-        _JsonCompactResponse(
-            {"object": "response.compaction", "compaction_summary": {"encrypted_content": "enc_summary_1"}}
-        )
-    )
+    session = _CompactSession(_compact_sse_response(encrypted_content="enc_summary_1"))
 
     result = await proxy_module.compact_responses(
         payload,
@@ -10505,7 +10545,7 @@ async def test_compact_responses_starts_upstream_timer_after_image_inlining(monk
     assert timeout.sock_read == pytest.approx(6.5)
     dumped = result.model_dump(mode="json", exclude_none=True)
     assert dumped["object"] == "response.compaction"
-    assert dumped["compaction_summary"]["encrypted_content"] == "enc_summary_1"
+    assert dumped["output"][0]["encrypted_content"] == "enc_summary_1"
     assert recorded["started_at"] == 205.5
 
 
@@ -10515,6 +10555,8 @@ async def test_compact_responses_derives_lite_http_header_from_additional_tools(
         upstream_base_url = "https://chatgpt.com/backend-api"
         upstream_connect_timeout_seconds = 1.0
         upstream_compact_timeout_seconds = 12.0
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
         image_inline_fetch_enabled = False
         trace_channels = frozenset()
 
@@ -10551,11 +10593,7 @@ async def test_compact_responses_derives_lite_http_header_from_additional_tools(
             "reasoning": {"context": "turn", "effort": "high", "vendor_hint": 7},
         }
     )
-    session = _CompactSession(
-        _JsonCompactResponse(
-            {"object": "response.compaction", "compaction_summary": {"encrypted_content": "enc_summary_1"}}
-        )
-    )
+    session = _CompactSession(_compact_sse_response(encrypted_content="enc_summary_1"))
 
     await proxy_module.compact_responses(
         payload,
@@ -10575,6 +10613,281 @@ async def test_compact_responses_derives_lite_http_header_from_additional_tools(
         "effort": "high",
         "vendor_hint": 7,
     }
+
+
+@pytest.mark.asyncio
+async def test_compact_responses_normalizes_preexisting_terminal_trigger_without_losing_tool_tail(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 1.0
+        upstream_compact_timeout_seconds = 12.0
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
+        image_inline_fetch_enabled = False
+        trace_channels = frozenset()
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    payload = proxy_module.ResponsesCompactRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "hi",
+            "input": [
+                {"role": "user", "content": "hello"},
+                {
+                    "type": "custom_tool_call",
+                    "name": "functions.exec_command",
+                    "call_id": "call_compact_tail",
+                    "input": '{"cmd":"pytest"}',
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_compact_tail",
+                    "output": "failed",
+                },
+                {"type": "compaction_trigger"},
+            ],
+        }
+    )
+    session = _CompactSession(
+        _JsonCompactResponse(
+            {"object": "response.compaction", "compaction_summary": {"encrypted_content": "enc_summary_1"}}
+        )
+    )
+
+    await proxy_module.compact_responses(
+        payload,
+        headers={},
+        access_token="token",
+        account_id="acc_1",
+        session=cast(proxy_module.aiohttp.ClientSession, session),
+    )
+
+    upstream_payload = cast(dict[str, object], session.calls[0]["json"])
+    compact_input = cast(list[dict[str, object]], upstream_payload["input"])
+    assert compact_input[-1] == {"type": "compaction_trigger"}
+    assert sum(1 for item in compact_input if item.get("type") == "compaction_trigger") == 1
+    assert compact_input[:-1] == [
+        {"role": "user", "content": "hello"},
+        {
+            "type": "custom_tool_call",
+            "name": "functions.exec_command",
+            "call_id": "call_compact_tail",
+            "input": '{"cmd":"pytest"}',
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_compact_tail",
+            "output": "failed",
+        },
+    ]
+
+
+def test_responses_wire_payload_normalizes_internal_duplicate_compaction_trigger():
+    payload = proxy_module.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "compact",
+            "input": [
+                {"role": "user", "content": "hello"},
+                {"type": "compaction_trigger"},
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+            "store": False,
+        }
+    ).to_payload()
+
+    compact_input = cast(list[dict[str, object]], payload["input"])
+    assert compact_input == [
+        {"role": "user", "content": "hello"},
+        {"type": "compaction_trigger"},
+    ]
+
+
+def test_compact_wire_payload_omits_oversized_optional_tool_tail_even_with_terminal_trigger():
+    payload = proxy_module.ResponsesCompactRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "",
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "read_file",
+                    "call_id": "call_route_tail",
+                    "arguments": "x" * 450_000,
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_route_tail",
+                    "output": "latest ordinary result",
+                },
+                {"type": "compaction_trigger"},
+            ],
+        }
+    )
+
+    dumped = payload.to_payload()
+    compact_input = cast(list[dict[str, object]], dumped["input"])
+
+    assert compact_input[-1] == {"type": "compaction_trigger"}
+    assert all(item.get("call_id") != "call_route_tail" for item in compact_input if isinstance(item, dict))
+    assert "[compact trim]" in json.dumps(compact_input)
+    assert "latest ordinary result" not in json.dumps(compact_input)
+
+
+def test_compact_discard_consumed_continuity_output_pairs_treats_terminal_trigger_as_suffix():
+    input_items: list[JsonValue] = [
+        {
+            "type": "function_call",
+            "name": "read_file",
+            "call_id": "call_reused",
+            "arguments": '{"path":"old.txt"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_reused",
+            "output": "consumed old output",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_reused",
+            "output": "latest output from the prior response",
+        },
+        {"type": "compaction_trigger"},
+    ]
+    selected_indices = {0, 1, 2, 3}
+    required_indices = {2, 3}
+
+    openai_requests_module._compact_discard_consumed_continuity_output_pairs(
+        input_items,
+        selected_indices=selected_indices,
+        required_indices=required_indices,
+    )
+
+    assert selected_indices == {2, 3}
+
+
+@pytest.mark.asyncio
+async def test_compact_responses_without_trigger_canonicalization_hits_upstream_duplicate_trigger_error(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 1.0
+        upstream_compact_timeout_seconds = 12.0
+        image_inline_fetch_enabled = False
+        trace_channels = frozenset()
+
+    class _DuplicateTriggerResponse:
+        status = 400
+        reason = "Bad Request"
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self, *, content_type=None):
+            return self._payload
+
+    class _DuplicateTriggerSession:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def post(self, url: str, *, json=None, headers=None, timeout=None):
+            self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+            upstream_payload = cast(dict[str, object], json)
+            compact_input = cast(list[dict[str, object]], upstream_payload["input"])
+            trigger_count = sum(1 for item in compact_input if item.get("type") == "compaction_trigger")
+            if trigger_count > 1:
+                return _DuplicateTriggerResponse(
+                    {
+                        "error": {
+                            "message": "Only one 'compaction_trigger' item may be provided",
+                            "type": "invalid_request_error",
+                            "param": "input",
+                            "code": "invalid_request_error",
+                        }
+                    }
+                )
+            return _JsonCompactResponse(
+                {"object": "response.compaction", "compaction_summary": {"encrypted_content": "enc_summary_1"}}
+            )
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    payload = proxy_module.ResponsesCompactRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "hi",
+            "input": [
+                {"role": "user", "content": "hello"},
+                {
+                    "type": "custom_tool_call",
+                    "name": "functions.exec_command",
+                    "call_id": "call_compact_tail",
+                    "input": '{"cmd":"pytest"}',
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_compact_tail",
+                    "output": "failed",
+                },
+                {"type": "compaction_trigger"},
+                {"type": "compaction_trigger"},
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        payload,
+        "to_payload",
+        lambda: {
+            "model": "gpt-5.1",
+            "instructions": "hi",
+            "input": [
+                {"role": "user", "content": "hello"},
+                {
+                    "type": "custom_tool_call",
+                    "name": "functions.exec_command",
+                    "call_id": "call_compact_tail",
+                    "input": '{"cmd":"pytest"}',
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_compact_tail",
+                    "output": "failed",
+                },
+                {"type": "compaction_trigger"},
+                {"type": "compaction_trigger"},
+            ],
+            "parallel_tool_calls": False,
+        },
+    )
+    session = _DuplicateTriggerSession()
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await proxy_module.compact_responses(
+            payload,
+            headers={},
+            access_token="token",
+            account_id="acc_1",
+            session=cast(proxy_module.aiohttp.ClientSession, session),
+        )
+
+    exc = _assert_proxy_response_error(exc_info.value)
+    assert exc.status_code == 400
+    assert _proxy_error_code(exc) == "invalid_request_error"
+    assert _proxy_error_message(exc) == "Only one 'compaction_trigger' item may be provided"
+    upstream_payload = cast(dict[str, object], session.calls[0]["json"])
+    compact_input = cast(list[dict[str, object]], upstream_payload["input"])
+    assert sum(1 for item in compact_input if item.get("type") == "compaction_trigger") == 2
 
 
 @pytest.mark.asyncio
@@ -10646,11 +10959,14 @@ async def test_compact_responses_uses_configured_timeout_and_maps_read_timeout(m
         upstream_base_url = "https://chatgpt.com/backend-api"
         upstream_connect_timeout_seconds = 2.0
         upstream_compact_timeout_seconds = 123.0
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
         image_inline_fetch_enabled = False
         trace_channels = frozenset()
 
     class _TimeoutCompactResponse:
         status = 200
+        headers: dict[str, str] = {}
 
         async def __aenter__(self):
             return self
@@ -10658,8 +10974,13 @@ async def test_compact_responses_uses_configured_timeout_and_maps_read_timeout(m
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        async def json(self, *, content_type=None):
-            raise proxy_module.aiohttp.SocketTimeoutError("Timeout on reading data from socket")
+        class _TimeoutContent:
+            async def iter_chunked(self, size: int):
+                del size
+                raise proxy_module.aiohttp.SocketTimeoutError("Timeout on reading data from socket")
+                yield b""
+
+        content = _TimeoutContent()
 
     monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
     monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
@@ -10696,6 +11017,8 @@ async def test_compact_responses_defaults_to_no_configured_request_timeout(monke
         upstream_base_url = "https://chatgpt.com/backend-api"
         upstream_connect_timeout_seconds = 2.0
         upstream_compact_timeout_seconds = None
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
         image_inline_fetch_enabled = False
         trace_channels = frozenset()
 
@@ -10706,11 +11029,7 @@ async def test_compact_responses_defaults_to_no_configured_request_timeout(monke
     payload = proxy_module.ResponsesCompactRequest.model_validate(
         {"model": "gpt-5.1", "instructions": "hi", "input": [{"role": "user", "content": "hi"}]}
     )
-    session = _CompactSession(
-        _JsonCompactResponse(
-            {"object": "response.compaction", "compaction_summary": {"encrypted_content": "enc_summary_2"}}
-        )
-    )
+    session = _CompactSession(_compact_sse_response(response_id="resp_compact_2", encrypted_content="enc_summary_2"))
 
     result = await proxy_module.compact_responses(
         payload,
@@ -10727,7 +11046,103 @@ async def test_compact_responses_defaults_to_no_configured_request_timeout(monke
     assert timeout.sock_read is None
     dumped = result.model_dump(mode="json", exclude_none=True)
     assert dumped["object"] == "response.compaction"
-    assert dumped["compaction_summary"]["encrypted_content"] == "enc_summary_2"
+    assert dumped["output"][0]["encrypted_content"] == "enc_summary_2"
+
+
+@pytest.mark.asyncio
+async def test_compact_responses_preserves_stream_idle_timeout_from_direct_sse(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 2.0
+        upstream_compact_timeout_seconds = 123.0
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
+        image_inline_fetch_enabled = False
+        trace_channels = frozenset()
+
+    async def fake_compact_response_payload_from_success_response(*args: object, **kwargs: object) -> JsonValue:
+        del args, kwargs
+        raise proxy_module.StreamIdleTimeoutError()
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+    monkeypatch.setattr(
+        proxy_module,
+        "_compact_response_payload_from_success_response",
+        fake_compact_response_payload_from_success_response,
+    )
+
+    payload = proxy_module.ResponsesCompactRequest.model_validate(
+        {"model": "gpt-5.1", "instructions": "hi", "input": [{"role": "user", "content": "hi"}]}
+    )
+    session = _CompactSession(_compact_sse_response())
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await proxy_module.compact_responses(
+            payload,
+            headers={},
+            access_token="token",
+            account_id="acc_1",
+            session=cast(proxy_module.aiohttp.ClientSession, session),
+        )
+
+    exc = _assert_proxy_response_error(exc_info.value)
+    assert exc.status_code == 502
+    assert _proxy_error_code(exc) == "stream_idle_timeout"
+    assert _proxy_error_message(exc) == "Upstream stream idle timeout"
+
+
+@pytest.mark.asyncio
+async def test_compact_responses_preserves_stream_event_too_large_from_routed_sse(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 2.0
+        upstream_compact_timeout_seconds = 123.0
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
+        image_inline_fetch_enabled = False
+        trace_channels = frozenset()
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    route = ResolvedUpstreamRoute(
+        mode="account_bound",
+        pool_id="pool_compact",
+        endpoint=ResolvedProxyEndpoint("ep_compact", "http", "proxy.test", 8080),
+    )
+    oversized_response = _SsePostResponse([b"data: " + b"x" * 2048 + b"\n\n"])
+    codex_client = SimpleNamespace(
+        request_with_route_metadata=AsyncMock(
+            return_value=SimpleNamespace(
+                response=oversized_response,
+                route=route,
+                fallback_used=False,
+            )
+        )
+    )
+    payload = proxy_module.ResponsesCompactRequest.model_validate(
+        {"model": "gpt-5.1", "instructions": "hi", "input": [{"role": "user", "content": "hi"}]}
+    )
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await proxy_module.compact_responses(
+            payload,
+            headers={},
+            access_token="token",
+            account_id="acc_1",
+            session=cast(proxy_module.aiohttp.ClientSession, object()),
+            route=route,
+            codex_client=cast(proxy_module.CodexClient, codex_client),
+            allow_direct_egress=False,
+        )
+
+    exc = _assert_proxy_response_error(exc_info.value)
+    assert exc.status_code == 502
+    assert _proxy_error_code(exc) == "stream_event_too_large"
+    assert "SSE event exceeded" in (_proxy_error_message(exc) or "")
 
 
 def test_sticky_key_for_responses_request_uses_bounded_cache_affinity():

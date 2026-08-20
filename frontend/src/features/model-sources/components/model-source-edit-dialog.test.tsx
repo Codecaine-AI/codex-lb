@@ -290,12 +290,25 @@ describe("ModelSourceEditDialog", () => {
     });
 
     const rawMetadata = JSON.parse(onSubmit.mock.calls[0][1].models[0].rawMetadataJson);
-    expect(rawMetadata).toEqual({ custom_key: "kept", supports_reasoning: true });
+    expect(rawMetadata).toEqual({
+      custom_key: "kept",
+      supports_reasoning: true,
+      supported_reasoning_levels: ["low", "medium", "high"],
+      default_reasoning_level: "medium",
+    });
   });
 
   it("prefills the reasoning toggle from raw metadata", () => {
     const source = createModelSource();
-    source.models[0].rawMetadataJson = '{"supports_reasoning": true}';
+    source.models[0].rawMetadataJson = JSON.stringify({
+      supports_reasoning: true,
+      supported_reasoning_levels: [
+        { effort: "none", description: "disable chain of thought" },
+        "provider-specific",
+        "ultra",
+      ],
+      default_reasoning_level: "provider-specific",
+    });
 
     renderWithProviders(
       <ModelSourceEditDialog
@@ -308,6 +321,49 @@ describe("ModelSourceEditDialog", () => {
     );
 
     expect(screen.getByRole("checkbox", { name: "Reasoning" })).toBeChecked();
+    expect(screen.getByLabelText("Supported reasoning efforts")).toHaveValue(
+      "none, provider-specific, ultra",
+    );
+    expect(screen.getByRole("combobox", { name: "Default reasoning effort" })).toHaveTextContent(
+      "provider-specific",
+    );
+  });
+
+  it("keeps arbitrary reasoning efforts and renormalizes a stale default", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const source = createModelSource();
+    source.models[0].rawMetadataJson = JSON.stringify({
+      supports_reasoning: true,
+      supported_reasoning_levels: ["none", "provider-specific", "ultra"],
+      default_reasoning_level: "provider-specific",
+    });
+
+    renderWithProviders(
+      <ModelSourceEditDialog
+        open
+        busy={false}
+        source={source}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    const reasoningEfforts = screen.getByLabelText("Supported reasoning efforts");
+    await user.clear(reasoningEfforts);
+    await user.type(reasoningEfforts, "none, custom-tier");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+
+    const rawMetadata = JSON.parse(onSubmit.mock.calls[0][1].models[0].rawMetadataJson);
+    expect(rawMetadata).toEqual({
+      supports_reasoning: true,
+      supported_reasoning_levels: ["none", "custom-tier"],
+      default_reasoning_level: "none",
+    });
   });
 
   it("sends the api key only when the field is filled", async () => {

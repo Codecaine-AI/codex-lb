@@ -1449,5 +1449,9 @@
   "upstreamProxy.toasts.poolUpdateFailed": "Proxy pool update failed",
   "upstreamProxy.validation.hostRequired": "Host is required",
   "upstreamProxy.validation.nameRequired": "Name is required",
-  "upstreamProxy.validation.portInvalid": "Enter a port between 1 and 65535"
+  "upstreamProxy.validation.portInvalid": "Enter a port between 1 and 65535",
+  "modelSources.fields.reasoningEfforts": "Supported reasoning efforts",
+  "modelSources.fields.reasoningEffortsDescription": "List the effort slugs this model source accepts and choose which one should be the default.",
+  "modelSources.fields.reasoningEffortsPlaceholder": "none, low, provider-specific",
+  "modelSources.fields.defaultReasoningEffort": "Default reasoning effort"
 }

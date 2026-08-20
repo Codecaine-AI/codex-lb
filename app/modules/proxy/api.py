@@ -3867,16 +3867,17 @@ def _canonical_model_slug(model: str) -> str:
 
 
 def _to_model_list_item(slug: str, model: UpstreamModel, *, created: int) -> ModelListItem:
+    context_window = _resolved_context_window(model)
     return ModelListItem.model_validate(
         {
             "id": slug,
             "created": created,
             "owned_by": "codex-lb",
-            "metadata": _to_model_metadata(model),
+            "metadata": _to_model_metadata(model, context_window=context_window),
             "api_types": ["chat_completions"],
-            "capabilities": _v1_model_capabilities(model),
-            "context_length": _v1_input_context_window(model),
-            "contextLength": _v1_input_context_window(model),
+            "capabilities": _v1_model_capabilities(model, context_window=context_window),
+            "context_length": context_window,
+            "contextLength": context_window,
             "max_output_tokens": _v1_max_output_tokens(model),
             "maxOutputTokens": _v1_max_output_tokens(model),
             "supports_reasoning": _v1_supports_reasoning(model),
@@ -3978,7 +3979,7 @@ def _to_codex_model_entry(model: UpstreamModel, *, visibility: str | None = None
             extra[key] = value
 
     # If context_window is overridden, also override max_context_window to match
-    effective_cw = _effective_context_window(model)
+    effective_cw = _resolved_context_window(model)
     if effective_cw != model.context_window and "max_context_window" in extra:
         extra["max_context_window"] = effective_cw
 
@@ -3996,7 +3997,7 @@ def _to_codex_model_entry(model: UpstreamModel, *, visibility: str | None = None
         support_verbosity=model.support_verbosity,
         default_verbosity=model.default_verbosity,
         supports_parallel_tool_calls=model.supports_parallel_tool_calls,
-        context_window=_effective_context_window(model),
+        context_window=effective_cw,
         input_modalities=list(model.input_modalities),
         available_in_plans=sorted(model.available_in_plans),
         prefer_websockets=model.prefer_websockets,
@@ -4010,18 +4011,39 @@ def _to_codex_model_entry(model: UpstreamModel, *, visibility: str | None = None
     )
 
 
-def _effective_context_window(model: UpstreamModel) -> int:
+def _resolved_context_window(model: UpstreamModel) -> int:
+    # An explicit operator context-window override is an assertion about the usable
+    # input budget, so it must also reach the generic OpenAI-compatible fields
+    # (`context_length`, `contextLength`, `capabilities.context_length`, and
+    # `metadata.input_context_window`). Generic clients read those rather than
+    # `metadata.context_window` and would otherwise cap themselves at the
+    # un-overridden upstream budget while Codex-native clients use the wider window.
+    # The override is clamped to the upstream-declared `max_context_window` so it can
+    # never advertise more input than the backend sanctions — the same clamp the Codex
+    # client applies to `model_context_window` in config.toml. The clamp only applies
+    # when upstream declares a ceiling strictly above `context_window`: bootstrap
+    # subscription models (`_bootstrap_model`) and source-catalog models
+    # (`source_models_to_upstream_models`) synthesize `max_context_window ==
+    # context_window` purely so Codex clients can parse the entry, and treating that
+    # parseability default as a real ceiling would silently disable every raise
+    # override for those models.
+    #
+    # This is the single resolution point for the reported window: the Codex-native
+    # `context_window`/`max_context_window` rewrite, `metadata.context_window`, and
+    # every input-budget field all share this one value, so an override above the
+    # backend ceiling can never split one model into two contradictory budgets.
     overrides = get_settings().model_context_window_overrides
-    return overrides.get(model.slug, model.context_window)
-
-
-def _v1_full_context_window(model: UpstreamModel) -> int:
-    overrides = get_settings().model_context_window_overrides
-    return overrides.get(model.slug, model.context_window)
-
-
-def _v1_input_context_window(model: UpstreamModel) -> int:
-    return model.context_window
+    override = overrides.get(model.slug)
+    if override is None:
+        return model.context_window
+    max_context_window = model.raw.get("max_context_window")
+    if (
+        isinstance(max_context_window, int)
+        and not isinstance(max_context_window, bool)
+        and max_context_window > model.context_window
+    ):
+        return min(override, max_context_window)
+    return override
 
 
 def _v1_max_output_tokens(model: UpstreamModel) -> int | None:
@@ -4031,11 +4053,11 @@ def _v1_max_output_tokens(model: UpstreamModel) -> int | None:
     return _V1_MAX_OUTPUT_TOKEN_OVERRIDES.get(model.slug)
 
 
-def _v1_model_capabilities(model: UpstreamModel) -> dict[str, JsonValue]:
+def _v1_model_capabilities(model: UpstreamModel, *, context_window: int) -> dict[str, JsonValue]:
     supports_streaming_raw = model.raw.get("supports_streaming")
     supports_streaming = supports_streaming_raw if isinstance(supports_streaming_raw, bool) else True
     return {
-        "context_length": _v1_input_context_window(model),
+        "context_length": context_window,
         "max_output_tokens": _v1_max_output_tokens(model),
         "supports_reasoning": _v1_supports_reasoning(model),
         "supports_images": _v1_supports_vision(model),
@@ -4083,12 +4105,12 @@ def _effective_source_codex_visibility(
     return "list"
 
 
-def _to_model_metadata(model: UpstreamModel) -> ModelMetadata:
+def _to_model_metadata(model: UpstreamModel, *, context_window: int) -> ModelMetadata:
     return ModelMetadata(
         display_name=model.display_name,
         description=model.description,
-        context_window=_v1_full_context_window(model),
-        input_context_window=_v1_input_context_window(model),
+        context_window=context_window,
+        input_context_window=context_window,
         max_output_tokens=_v1_max_output_tokens(model),
         input_modalities=list(model.input_modalities),
         supported_reasoning_levels=[

@@ -27,3 +27,7 @@ See `openspec/specs/proxy-runtime-observability/spec.md` for normative requireme
   PostgreSQL datasource that points to the codex-lb database from the visible
   **PostgreSQL** dropdown. A datasource registered only as a frontend runtime
   plugin is not listed by Grafana's datasource variable.
+- Timeout invariant violation logs describe startup `Settings` and imported
+  constant validation only. They intentionally avoid request-scoped overrides,
+  runtime-derived effective timeout values, payloads, API keys, access tokens,
+  raw affinity keys, account emails, and other high-cardinality identifiers.

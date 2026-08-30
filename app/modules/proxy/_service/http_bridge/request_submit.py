@@ -2651,6 +2651,10 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state.response_event_count,
                     int(request_state.response_id is not None or request_state.latency_response_created_ms is not None),
                 ),
+                # The session was already closed when the last admission
+                # waiter cancelled; its reader is gone, so post-suspension
+                # liveness signals cannot make it serviceable again.
+                allow_liveness_revive=False,
             )
         await self._maybe_release_idle_http_bridge_session_lease(session)
 
@@ -3021,9 +3025,30 @@ class _HTTPBridgeRequestSubmitMixin:
         response_events_seen: int | None = None,
         retired_request_count: int | None = None,
         retry_circuit_attempt_selection: _HTTPBridgeRetryCircuitAttemptSelection | None = None,
+        allow_liveness_revive: bool = True,
     ) -> None:
         async with session.pending_lock:
             retired_request_states = list(session.pending_requests)
+            baseline_completed_response_id = session.last_completed_response_id
+            # Baseline the upstream event generation at entry, alongside the
+            # completed-response baseline, so a prelude-only upstream event
+            # arriving during the retry-circuit strike await (which bumps the
+            # generation without touching per-request response counters) is
+            # still detected as post-suspension liveness.
+            baseline_event_generation = session.last_upstream_event_generation
+            # Snapshot the retirement fences at entry. Fence owners (durable
+            # stale-owner rejection, never-graft replacement rejection,
+            # previous-response-owner unavailability, alias-registration
+            # failure) set ``closed``/``reconnect_requested``/
+            # ``retire_after_drain`` without detaching the session or claiming
+            # the upstream close, so identity and close-claim guards alone
+            # cannot see them. A fence raised after this snapshot must survive
+            # the liveness revive below; erasing it would turn the fence
+            # owner's drain-retirement into a permanent no-op and let a
+            # condemned socket stay registered and reusable.
+            entry_closed = session.closed
+            entry_reconnect_requested = session.upstream_control.reconnect_requested
+            entry_retire_after_drain = session.upstream_control.retire_after_drain
             if retired_request_count is None:
                 retired_request_count = sum(
                     1
@@ -3109,13 +3134,90 @@ class _HTTPBridgeRequestSubmitMixin:
                         cache_key_family=session.key.affinity_kind,
                         model_class=_extract_model_class(session.request_model) if session.request_model else None,
                     )
-        session.closed = True
+
+        async with session.pending_lock:
+            current_response_events_seen = max(
+                (getattr(request_state, "response_event_count", 0) for request_state in session.pending_requests),
+                default=0,
+            )
+            current_response_created = any(
+                request_state.response_id is not None or request_state.latency_response_created_ms is not None
+                for request_state in session.pending_requests
+            )
+            completed_response_id = session.last_completed_response_id
+        # The snapshot above avoids awaiting pending_lock while the global
+        # registry lock is held, preserving bounded cleanup for other sessions.
+        caller_response_events_seen = response_events_seen or 0
+        observed_new_completed_response = (
+            completed_response_id is not None and completed_response_id != baseline_completed_response_id
+        )
+        became_healthy_during_suspend = current_response_events_seen > caller_response_events_seen or (
+            caller_response_events_seen == 0 and (current_response_created or observed_new_completed_response)
+        )
+        should_close = False
         async with self._http_bridge_lock:
+            if session.last_upstream_event_generation != baseline_event_generation:
+                became_healthy_during_suspend = True
+            # A fence raised while this coroutine was suspended condemns the
+            # session even if it also showed liveness: the fence owner leaves
+            # the session registered and never claims the upstream close, so
+            # neither guard below can see it. Only fences newly raised since
+            # the entry snapshot block the revive; the entry-time retirement
+            # state belongs to this retirement and is cleared on revive.
+            fence_raised_during_suspend = (
+                (session.closed and not entry_closed)
+                or (session.upstream_control.reconnect_requested and not entry_reconnect_requested)
+                or (session.upstream_control.retire_after_drain and not entry_retire_after_drain)
+            )
             # Bounded close may return while resource finalization is still
             # running. Detachment transfers ownership instead of freeing the
             # capacity slot at canonical removal, and leaves a failed close
             # discoverable by shutdown/account invalidation for a later retry.
-            self._detach_http_bridge_session_locked(session.key, expected_session=session)
+            if session.upstream_close_attempted:
+                # A close owner already claimed retirement; converge with its
+                # bookkeeping and fall through so this path still emits the
+                # shared retirement telemetry (``should_close`` resolves to
+                # False below, so the close is not re-attempted).
+                session.closed = True
+                self._detach_http_bridge_session_locked(session.key, expected_session=session)
+            elif (
+                allow_liveness_revive
+                and became_healthy_during_suspend
+                and not fence_raised_during_suspend
+                and self._http_bridge_sessions.get(session.key) is session
+            ):
+                # The pending snapshot is only advisory; a terminal response
+                # may already have left the deque. A close owner cannot have
+                # claimed retirement in between: the branch above falls
+                # through under this same lock hold without awaiting.
+                #
+                # Revive only while this session is still the registered owner
+                # of its key. The acquisition loop can detach a
+                # ``retiring_with_visible_requests`` generation with
+                # ``mark_closed=False`` while this coroutine is suspended;
+                # clearing the retirement flags on that detached generation
+                # would make its drain-retirement a permanent no-op and leak
+                # the socket, durable/account leases, and capacity slot. A
+                # detached generation falls through to the bounded close
+                # below instead (the detach call is a no-op for it), as does
+                # a session fenced during the suspension: the bounded close
+                # conservatively satisfies the fence owner's intent.
+                #
+                # ``allow_liveness_revive=False`` callers (the reader-failure
+                # funnel and deferred retirement of an already-closed session)
+                # never reach this branch. Their pending turns were already
+                # terminally failed and their reader is condemned, so there is
+                # no turn left for the revive to save — and the
+                # completed-response signal above can be advanced by durable
+                # anchor rehydration, which copies registry state without any
+                # upstream evidence. Reviving there would leave a condemned,
+                # readerless session registered and reusable.
+                session.closed = False
+                session.upstream_control.reconnect_requested = False
+                session.upstream_control.retire_after_drain = False
+                return
+            else:
+                self._detach_http_bridge_session_locked(session.key, expected_session=session)
         async with session.pending_lock:
             should_close = not session.upstream_close_attempted
             if should_close:

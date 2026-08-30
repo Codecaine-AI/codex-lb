@@ -1671,6 +1671,13 @@ class _HTTPBridgeUpstreamEventsMixin:
                             session,
                             detail=poison_detail,
                             response_events_seen=observed_response_events,
+                            # Reader-failure retirement must never revive: the
+                            # pending turns were already terminally failed and
+                            # this reader is condemned, so a post-suspension
+                            # liveness signal (which durable-anchor
+                            # rehydration can spoof without upstream evidence)
+                            # would only leave a readerless session registered.
+                            allow_liveness_revive=False,
                             **retry_circuit_attempt_kwargs,
                         )
                         force_retire = True
@@ -1704,6 +1711,9 @@ class _HTTPBridgeUpstreamEventsMixin:
                         retry_circuit_detail="clean_close",
                         response_events_seen=observed_response_events,
                         retired_request_count=failed_pending_count,
+                        # See the poison branch above: reader-failure
+                        # retirement never revives a condemned session.
+                        allow_liveness_revive=False,
                         **retry_circuit_attempt_kwargs,
                     )
                 else:
@@ -1718,6 +1728,9 @@ class _HTTPBridgeUpstreamEventsMixin:
                         # strike. The deferred/poison branch records its own
                         # strike above and intentionally does not pass it.
                         retired_request_count=failed_pending_count,
+                        # See the poison branch above: reader-failure
+                        # retirement never revives a condemned session.
+                        allow_liveness_revive=False,
                         **retry_circuit_attempt_kwargs,
                     )
         return force_retire or session.admission_waiter_count == 0
@@ -2337,6 +2350,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                 # that attempt transition before any later recovery await can
                 # classify the send as eventless.
                 _mark_response_create_attempt_observed(matched_request_state, event_type)
+                session.last_upstream_event_generation += 1
                 now = _service_time().monotonic()
                 if matched_request_state.latency_first_upstream_event_ms is None:
                     matched_request_state.latency_first_upstream_event_ms = int(

@@ -14,9 +14,6 @@ from ipaddress import ip_address
 from typing import Any, Literal, Mapping, TypeVar, cast
 from urllib.parse import urlparse
 
-import anyio
-from anyio.lowlevel import checkpoint_if_cancelled
-
 from app.core import shutdown as shutdown_state
 from app.core.balancer.rendezvous_hash import select_node
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
@@ -48,6 +45,8 @@ from app.core.errors import (
     HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
     OpenAIErrorDetail,
     OpenAIErrorEnvelope,
+    OpenAIErrorParam,
+    coerce_error_param,
     openai_error,
     previous_response_stream_incomplete_error,
     response_failed_event,
@@ -71,7 +70,7 @@ from app.core.openai.requests import (
 from app.core.resilience.overload import local_overload_error
 from app.core.types import JsonValue
 from app.core.utils.request_id import get_request_id
-from app.core.utils.shared_future import wait_on_shared_future
+from app.core.utils.shared_future import _await_task_deferring_cancellation, wait_on_shared_future
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
@@ -721,39 +720,6 @@ def _http_bridge_eventless_timeout_message(unmatched_upstream_liveness_count: in
     return _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE
 
 
-async def _await_task_deferring_cancellation(
-    task: asyncio.Task[T],
-) -> tuple[T, asyncio.CancelledError | None]:
-    """Finish critical cleanup while preserving the caller's cancellation."""
-
-    cancellation: asyncio.CancelledError | None = None
-    # The anyio shield keeps a level-cancelled Starlette scope from re-raising
-    # into every ``await``, which would otherwise busy-spin this loop until the
-    # owned task completes. ``wait_on_shared_future`` keeps the loop's waits
-    # off the task's done-callback list: Python 3.14's ``asyncio.shield``
-    # leaks a callback per cancelled wait, so re-shielding a task wedged on a
-    # lock grew 100k+ callbacks and O(n^2) remove scans in the 2026-08-30
-    # production event-loop livelock.
-    with anyio.CancelScope(shield=True):
-        while True:
-            try:
-                result = await wait_on_shared_future(task)
-                break
-            except asyncio.CancelledError as exc:
-                if task.cancelled():
-                    raise
-                cancellation = cancellation or exc
-    if cancellation is None:
-        # The shield also blocks the level cancellation this helper promises
-        # to surface. Probe for it without suspending so callers still get
-        # their cancellation marker after the owned task finished.
-        try:
-            await checkpoint_if_cancelled()
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-    return result, cancellation
-
-
 @dataclass(frozen=True, slots=True)
 class _HTTPBridgeRuntimeConfig:
     enabled: bool
@@ -1101,13 +1067,15 @@ def _log_http_bridge_startup_wait_timeout(
     )
 
 
-def _http_bridge_precreated_retry_failure_error(exc: BaseException) -> tuple[int, str, str, str, str | None]:
+def _http_bridge_precreated_retry_failure_error(
+    exc: BaseException,
+) -> tuple[int, str, str, str, OpenAIErrorParam | None]:
     if isinstance(exc, ProxyResponseError):
         parsed = _parse_openai_error(exc.payload)
         code = _normalize_error_code(parsed.code if parsed else None, parsed.type if parsed else None)
         message = parsed.message if parsed and parsed.message else "HTTP bridge pre-created retry failed"
         error_type = parsed.type if parsed and parsed.type else "server_error"
-        error_param = parsed.param if parsed else None
+        error_param = parsed.param_state if parsed else None
         return exc.status_code, code, message, error_type, error_param
     if isinstance(exc, TimeoutError):
         return (
@@ -1175,7 +1143,7 @@ def _normalize_http_bridge_error_event(
     error_code_value: str | None = None
     error_type_value: str | None = None
     error_message_value: str | None = None
-    error_param_value: str | None = None
+    error_param_value: OpenAIErrorParam | None = None
     explicit_error_code = False
     rate_limit_metadata: OpenAIErrorDetail = {}
 
@@ -1183,7 +1151,7 @@ def _normalize_http_bridge_error_event(
         error_code_value = event.error.code
         error_type_value = event.error.type
         error_message_value = event.error.message
-        error_param_value = event.error.param
+        error_param_value = event.error.param_state
         if isinstance(error_code_value, str) and error_code_value.strip():
             explicit_error_code = True
     elif isinstance(payload, dict):
@@ -1207,18 +1175,13 @@ def _normalize_http_bridge_error_event(
                 stripped = message_value.strip()
                 if stripped:
                     error_message_value = stripped
-            param_value = payload_error.get("param")
-            if isinstance(param_value, str):
-                error_param_value = param_value.strip()
-
     if isinstance(payload, dict):
         raw_error = payload.get("error")
         if not isinstance(raw_error, dict):
             raw_error = _websocket_top_level_error_payload(payload)
         if isinstance(raw_error, dict):
-            if "param" in raw_error:
-                raw_param = raw_error.get("param")
-                error_param_value = raw_param.strip() if isinstance(raw_param, str) else ""
+            if error_param_value is None and "param" in raw_error:
+                error_param_value = OpenAIErrorParam.from_mapping(cast(Mapping[str, JsonValue], raw_error))
             plan_type = raw_error.get("plan_type")
             if isinstance(plan_type, str):
                 rate_limit_metadata["plan_type"] = plan_type
@@ -1238,7 +1201,7 @@ def _normalize_http_bridge_error_event(
         if request_state.error_message_override is not None:
             error_message_value = request_state.error_message_override
         if request_state.error_param_override is not None:
-            error_param_value = request_state.error_param_override
+            error_param_value = coerce_error_param(request_state.error_param_override)
 
     normalized_error_code = _normalize_error_code(error_code_value, error_type_value) or "upstream_error"
     if not explicit_error_code and normalized_error_code == "error":
@@ -3400,6 +3363,9 @@ def _http_bridge_should_attempt_local_previous_response_recovery(exc: ProxyRespo
     raw_code = code_value.strip() if isinstance(code_value, str) and code_value.strip() else None
     type_value = error.get("type")
     error_type = type_value.strip() if isinstance(type_value, str) and type_value.strip() else None
+    param_state = OpenAIErrorParam.from_mapping(cast(Mapping[str, JsonValue], error))
+    if param_state.malformed:
+        return False
     # Normalize like the websocket rewrite path (#1818): upstream frames may
     # carry the classifiable code only in ``type`` (or omit both code and
     # param on the terse previous-response rejection), and a raw read would
@@ -3420,13 +3386,9 @@ def _http_bridge_should_attempt_local_previous_response_recovery(exc: ProxyRespo
             "server_anchored_replay_once",
             "server_indefinite_recovery",
         }
-    param_value = error.get("param")
-    if "param" in error and not isinstance(param_value, str):
-        return False
-    param = param_value.strip() if isinstance(param_value, str) else None
     message_value = error.get("message")
     message = message_value.strip() if isinstance(message_value, str) and message_value.strip() else None
-    return _is_previous_response_not_found_error(code=code, param=param, message=message)
+    return _is_previous_response_not_found_error(code=code, param=param_state, message=message)
 
 
 def _http_bridge_is_explicit_previous_response_rejection(exc: ProxyResponseError) -> bool:
@@ -3440,16 +3402,15 @@ def _http_bridge_is_explicit_previous_response_rejection(exc: ProxyResponseError
     raw_code = code_value.strip() if isinstance(code_value, str) and code_value.strip() else None
     type_value = error.get("type")
     error_type = type_value.strip() if isinstance(type_value, str) and type_value.strip() else None
+    param_state = OpenAIErrorParam.from_mapping(cast(Mapping[str, JsonValue], error))
+    if param_state.malformed:
+        return False
     code = _normalize_error_code(raw_code, error_type)
     if code == "bridge_previous_response_not_found":
         return True
-    param_value = error.get("param")
-    if "param" in error and not isinstance(param_value, str):
-        return False
-    param = param_value.strip() if isinstance(param_value, str) else None
     message_value = error.get("message")
     message = message_value.strip() if isinstance(message_value, str) and message_value.strip() else None
-    return _is_previous_response_not_found_error(code=code, param=param, message=message)
+    return _is_previous_response_not_found_error(code=code, param=param_state, message=message)
 
 
 def _http_bridge_is_previous_response_owner_unavailable(exc: ProxyResponseError) -> bool:

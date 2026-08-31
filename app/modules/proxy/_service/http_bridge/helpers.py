@@ -7,7 +7,7 @@ import logging
 import math
 import sys
 import time
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from ipaddress import ip_address
@@ -1361,6 +1361,14 @@ def _http_bridge_retry_circuit_attempt_selection_for_pending_requests(
         if attempt is None:
             continue
         attempt_seen = True
+        # A request still holding a verified safe replay must not be charged
+        # anywhere: in a mixed batch its attempt would otherwise be the sole
+        # selectable one (charging the recoverable request) or make the
+        # stranded request's failure look ambiguous. It still counts as a
+        # seen attempt, so a safe-only batch classifies as ineligible rather
+        # than absent — absent is what authorizes an unscoped strike.
+        if _http_bridge_request_state_holds_safe_replay(request_state):
+            continue
         if attempt.retry_circuit_failure_recorded:
             recorded_attempts.append(attempt)
             continue
@@ -1393,6 +1401,57 @@ def _http_bridge_retry_circuit_attempt_selection_for_pending_requests(
                 attempts=tuple(unique_attempts),
             )
     return _HTTPBridgeRetryCircuitAttemptSelection(kind="ineligible" if attempt_seen else "absent")
+
+
+def _http_bridge_continuity_bound_without_safe_replay(request_state: _WebSocketRequestState) -> bool:
+    """Return whether retrying would require replaying an unsafe continuation."""
+    if request_state.previous_response_id is not None:
+        return not _http_bridge_request_state_holds_safe_replay(request_state)
+    return request_state.hard_continuity_anchor and not _http_bridge_request_state_holds_safe_replay(request_state)
+
+
+def _http_bridge_request_state_holds_safe_replay(request_state: Any) -> bool:
+    """Whether the request still holds a verified safe replay to protect.
+
+    Holding one means the proof fields are set AND the one permitted replay is
+    still available. ``_retry_http_bridge_request_on_fresh_upstream`` leaves
+    the proof fields in place after consuming the replay, so a request whose
+    permitted replay already failed is stranded like any other: it must strike
+    the circuit and must not keep an abandonment from settling it. The same
+    retry path also refuses a request that has observed a response event, so a
+    started response holds no replay either — counting it would leave the
+    circuit cooling for its full backoff after a successful abandonment, for a
+    replay that can never dispatch.
+    """
+    return bool(
+        getattr(request_state, "fresh_upstream_request_is_retry_safe", False)
+        and getattr(request_state, "fresh_upstream_request_text", None)
+        and getattr(request_state, "replay_count", 0) == 0
+        and getattr(request_state, "response_event_count", 0) == 0
+        # A deferred-reasoning prelude marks the response started without
+        # counting a response event, and a started response cannot replay.
+        and not getattr(request_state, "upstream_model_output_seen", False)
+    )
+
+
+def _http_bridge_abandonment_may_settle_circuit(request_states: Iterable[Any]) -> bool:
+    """Return whether this abandonment may settle the retry circuit with it.
+
+    The circuit must survive exactly one thing: a request that still holds a
+    safe replay. That replay claims the circuit's generation at dispatch
+    (#1863), so clearing the circuit under it removes the fence it depends on.
+    Every other case is a cooldown backing off a cause this abandonment just
+    removed — anchored or not. Requiring every state to also be
+    continuity-bound let an unanchored full-resend request, which has no
+    replay to protect, block the settle and keep the key cooling for its full
+    backoff after the anchor was already gone.
+
+    An empty set therefore settles. Terminal notification drains
+    ``pending_requests`` before retirement, so the funnels routinely reach here
+    with a pre-drain count and no states at all; nothing is holding the
+    generation.
+    """
+    return not any(_http_bridge_request_state_holds_safe_replay(state) for state in request_states if state is not None)
 
 
 def _http_bridge_session_has_admission_waiter(session: object | None) -> bool:

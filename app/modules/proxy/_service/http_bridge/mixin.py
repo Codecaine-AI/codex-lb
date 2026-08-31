@@ -48,7 +48,6 @@ from app.core.metrics.prometheus import (
 from app.core.utils.request_id import ensure_request_scope_id
 from app.core.utils.shared_future import wait_on_shared_future
 from app.db.models import (
-    AccountStatus,
     StickySessionKind,
 )
 from app.modules.api_keys.service import (
@@ -209,6 +208,8 @@ from app.modules.proxy._service.warmup import (
 from app.modules.proxy._service.warmup import (
     _WarmupUsageSnapshot as _WarmupUsageSnapshot,
 )
+from app.modules.proxy.account_eligibility import ROUTABLE_STATUSES
+from app.modules.proxy.account_eligibility import account_access_token_expires_at as _token_expiry
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
     _extract_model_class,
@@ -775,7 +776,7 @@ class _HTTPBridgeMixin(
                     existing = None
                 if existing is not None and (
                     force_goal_restart_account_reselection
-                    or (not existing.closed and existing.account.status == AccountStatus.ACTIVE)
+                    or (not existing.closed and existing.account.status in ROUTABLE_STATUSES)
                 ):
                     old_account_id = existing.account.id
                     retiring_with_visible_requests = _http_bridge_session_retiring_with_visible_requests(existing)
@@ -1481,7 +1482,7 @@ class _HTTPBridgeMixin(
                         session.last_used_at = _service_time().monotonic()
                         return session
                 if force_goal_restart_account_reselection or (
-                    not session.closed and session.account.status == AccountStatus.ACTIVE
+                    not session.closed and session.account.status in ROUTABLE_STATUSES
                 ):
                     old_account_id = session.account.id
                     retiring_with_visible_requests = _http_bridge_session_retiring_with_visible_requests(session)
@@ -1972,6 +1973,7 @@ class _HTTPBridgeMixin(
             last_used_at=_service_time().monotonic(),
             idle_ttl_seconds=idle_ttl_seconds,
             codex_session=(affinity.kind == StickySessionKind.CODEX_SESSION or key.affinity_kind == "thread_header"),
+            access_token_expires_at=_token_expiry(account, self._encryptor),
             prewarm_lock=anyio.Lock(),
             upstream_turn_state=_upstream_turn_state_from_socket(upstream),
             downstream_turn_state=None,
@@ -2411,7 +2413,7 @@ class _HTTPBridgeMixin(
                     await self._load_balancer.release_account_lease(old_lease)
                     session.account_lease = None
             session.account_lease = selected_account_lease
-            session.account, session.headers, session.upstream = account, connect_headers, upstream
+            session.replace_connection(account, connect_headers, upstream, _token_expiry(account, self._encryptor))
             session.catalog_omission_quota_admission = selection.catalog_omission_quota_admission
             session.upstream_control = _WebSocketUpstreamControl()
             session.closed = False

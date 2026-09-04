@@ -403,6 +403,15 @@ def _http_bridge_client_full_history_recovery_error() -> OpenAIErrorEnvelope:
     return payload
 
 
+def _http_bridge_hard_continuity_full_history_recovery_error() -> OpenAIErrorEnvelope:
+    """Ask Codex to discard a hard turn-state anchor and resend full history."""
+    return openai_error(
+        "previous_response_not_found",
+        "Continuity state was not found; retry with full history.",
+        error_type="invalid_request_error",
+    )
+
+
 async def _rollback_http_bridge_recovery_turn_state_registration(
     service: Any,
     receipt: DurableBridgeAliasRegistrationReceipt,
@@ -1578,6 +1587,41 @@ class _HTTPBridgeRequestSubmitMixin:
                     openai_error(
                         "bridge_continuity_persistence_failed",
                         "The recovery checkpoint was already consumed; retry the request.",
+                    ),
+                )
+            if not operation.created and operation.state == "abandoned":
+                hard_continuity_recovery = (
+                    request_state.previous_response_id is None
+                    and _http_bridge_operation_fence_for_hard_continuity_enabled(request_state)
+                )
+                _record_continuity_fail_closed(
+                    surface="http_bridge",
+                    reason=(
+                        "abandoned_hard_continuity_full_history_recovery"
+                        if hard_continuity_recovery
+                        else "abandoned_operation_full_history_recovery"
+                    ),
+                    previous_response_id=request_state.previous_response_id,
+                    session_id=request_state.session_id,
+                    upstream_error_code="previous_response_not_found",
+                )
+                # The recovery journal may already hold an UNKNOWN row for
+                # this request. Release it before rejecting so an identical
+                # anchored resend sees the same 400 instead of a 502
+                # "another recovery request is already in flight".
+                await self._cleanup_http_bridge_submit_interruption(
+                    session,
+                    request_state=request_state,
+                    gate_acquired=False,
+                    request_enqueued=False,
+                    counted_in_queue=False,
+                )
+                raise ProxyResponseError(
+                    400,
+                    (
+                        _http_bridge_hard_continuity_full_history_recovery_error()
+                        if hard_continuity_recovery
+                        else _http_bridge_client_full_history_recovery_error()
                     ),
                 )
             if not operation.created and not getattr(operation, "rebound", False):

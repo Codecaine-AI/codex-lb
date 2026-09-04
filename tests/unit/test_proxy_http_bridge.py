@@ -44190,3 +44190,222 @@ def test_suppression_message_names_the_timer_that_is_refusing_the_request() -> N
     assert "cooling down" not in half_open
     assert "480s" in half_open
     assert "42s" in cooldown
+
+
+def _make_relay_parity_request_state(
+    *,
+    response_id: str | None = "resp_relay_parity",
+    replay_downstream_response_id: str | None = None,
+) -> proxy_service._WebSocketRequestState:
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-relay-parity",
+        response_id=response_id,
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        event_queue=asyncio.Queue(),
+        transport="http",
+        skip_request_log=True,
+    )
+    request_state.replay_downstream_response_id = replay_downstream_response_id
+    return request_state
+
+
+def _relay_parity_downstream_block(request_state: proxy_service._WebSocketRequestState) -> str:
+    assert request_state.event_queue is not None
+    event_block = request_state.event_queue.get_nowait()
+    assert isinstance(event_block, str)
+    return event_block
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_relays_unchanged_event_as_upstream_json_text() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = _make_relay_parity_request_state()
+    session = _make_bridge_session(pending_requests=deque([request_state]), queued_request_count=1)
+    payload = {
+        "type": "response.output_text.delta",
+        "item_id": "msg_1",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "\ud55c\uae00 \u2028 caf\u00e9",
+    }
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    await service._process_http_bridge_upstream_text(session, text)
+
+    event_block = _relay_parity_downstream_block(request_state)
+    assert event_block == f"event: response.output_text.delta\ndata: {text}\n\n"
+    # JSON-equivalent to the re-serialized block the reader used to emit; only the
+    # escaping differs (upstream UTF-8 is kept, not ``\\uXXXX``-escaped).
+    legacy_block = proxy_service.format_sse_event(payload)
+    assert proxy_service.parse_sse_data_json(event_block) == proxy_service.parse_sse_data_json(legacy_block)
+    assert event_block != legacy_block
+    assert request_state.downstream_visible is True
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_ascii_relay_is_byte_identical_to_serialization() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = _make_relay_parity_request_state()
+    session = _make_bridge_session(pending_requests=deque([request_state]), queued_request_count=1)
+    payload = {"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0, "delta": "hello"}
+    text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+    await service._process_http_bridge_upstream_text(session, text)
+
+    assert _relay_parity_downstream_block(request_state) == proxy_service.format_sse_event(payload)
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_reserializes_when_response_id_is_rewritten() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = _make_relay_parity_request_state(
+        response_id="resp_upstream",
+        replay_downstream_response_id="resp_client_visible",
+    )
+    session = _make_bridge_session(pending_requests=deque([request_state]), queued_request_count=1)
+    payload = {
+        "type": "response.in_progress",
+        "response": {"id": "resp_upstream", "status": "in_progress", "metadata": {"note": "caf\u00e9"}},
+    }
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    await service._process_http_bridge_upstream_text(session, text)
+
+    event_block = _relay_parity_downstream_block(request_state)
+    rewritten = proxy_service.parse_sse_data_json(event_block)
+    assert rewritten is not None
+    assert cast(dict[str, Any], rewritten["response"])["id"] == "resp_client_visible"
+    assert event_block == proxy_service.format_sse_event(rewritten)
+    assert text not in event_block
+
+
+def _relay_parity_parallel_tool_call_done_text(call_id: str, patch_inputs: list[str]) -> str:
+    arguments = json.dumps(
+        {
+            "tool_uses": [
+                {"recipient_name": "functions.apply_patch", "parameters": {"input": patch_input}}
+                for patch_input in patch_inputs
+            ]
+        },
+        separators=(",", ":"),
+    )
+    return json.dumps(
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp_relay_parity",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": f"fc_{call_id}",
+                "call_id": call_id,
+                "name": "multi_tool_use.parallel",
+                "arguments": arguments,
+                "status": "completed",
+            },
+        },
+        separators=(",", ":"),
+    )
+
+
+def _relay_parity_parallel_patch_inputs(event_block: str) -> list[str]:
+    payload = proxy_service.parse_sse_data_json(event_block)
+    assert payload is not None
+    item = cast(dict[str, Any], payload["item"])
+    arguments = json.loads(cast(str, item["arguments"]))
+    return [tool_use["parameters"]["input"] for tool_use in arguments["tool_uses"]]
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_relays_trimmed_parallel_tool_uses_not_upstream_text() -> None:
+    # ``mark_duplicate_tool_call_downstream_event`` trims partially duplicated
+    # parallel tool uses by mutating the payload in place (no new object), so the
+    # identity fast path must not relay the untrimmed upstream text.
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = _make_relay_parity_request_state()
+    session = _make_bridge_session(pending_requests=deque([request_state]), queued_request_count=1)
+
+    await service._process_http_bridge_upstream_text(
+        session, _relay_parity_parallel_tool_call_done_text("call_1", ["A", "B"])
+    )
+    second_text = _relay_parity_parallel_tool_call_done_text("call_2", ["A", "C"])
+    await service._process_http_bridge_upstream_text(session, second_text)
+
+    first_block = _relay_parity_downstream_block(request_state)
+    second_block = _relay_parity_downstream_block(request_state)
+    assert _relay_parity_parallel_patch_inputs(first_block) == ["A", "B"]
+    assert _relay_parity_parallel_patch_inputs(second_block) == ["C"]
+    assert second_text not in second_block
+    assert request_state.suppressed_duplicate_tool_call is False
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_fast_path_only_frames_text_that_serializes_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fast_path_event_types: list[str | None] = []
+    original_format_sse_event_from_text = http_bridge_upstream_events_module.format_sse_event_from_text
+
+    def _asserting_format_sse_event_from_text(payload: Mapping[str, Any], text: str) -> str:
+        # Precondition of the identity fast path: the relayed text must still be
+        # a serialization of the (possibly mutated) payload it was parsed from.
+        assert json.loads(text) == payload
+        fast_path_event_types.append(cast(str | None, payload.get("type")))
+        return original_format_sse_event_from_text(payload, text)
+
+    monkeypatch.setattr(
+        http_bridge_upstream_events_module,
+        "format_sse_event_from_text",
+        _asserting_format_sse_event_from_text,
+    )
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = _make_relay_parity_request_state()
+    session = _make_bridge_session(pending_requests=deque([request_state]), queued_request_count=1)
+    upstream_texts = [
+        json.dumps(
+            {"type": "response.created", "response": {"id": "resp_relay_parity", "status": "in_progress"}},
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            {
+                "type": "response.output_item.added",
+                "response_id": "resp_relay_parity",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1", "summary": []},
+            },
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "한글   café",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            {"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 1, "delta": "hello"},
+            separators=(",", ":"),
+        ),
+        _relay_parity_parallel_tool_call_done_text("call_1", ["A", "B"]),
+        _relay_parity_parallel_tool_call_done_text("call_2", ["A", "C"]),
+    ]
+
+    for text in upstream_texts:
+        await service._process_http_bridge_upstream_text(session, text)
+
+    downstream_blocks = [_relay_parity_downstream_block(request_state) for _ in upstream_texts]
+    assert [
+        proxy_service.parse_sse_data_json(block) == json.loads(text)
+        for block, text in zip(downstream_blocks, upstream_texts, strict=True)
+    ] == [True, True, True, True, True, False]
+    assert _relay_parity_parallel_patch_inputs(downstream_blocks[-1]) == ["C"]
+    assert "response.output_text.delta" in fast_path_event_types
+    assert "response.reasoning_summary_text.delta" in fast_path_event_types
+    assert "response.output_item.done" not in fast_path_event_types

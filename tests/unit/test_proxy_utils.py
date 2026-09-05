@@ -9412,26 +9412,105 @@ def test_stream_startup_error_response_rejects_malformed_retry_after_header() ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["queued", "in_progress"])
-async def test_non_streaming_response_preserves_unfinished_status(status: str) -> None:
-    event_block, event_type = proxy_module._non_streaming_response_event(
-        {"id": "resp_background", "status": status, "output": []}
-    )
+@pytest.mark.parametrize(
+    "extra_fields",
+    [
+        {},
+        {"usage": {"input_tokens": 12, "output_tokens": 0, "total_tokens": 12}},
+    ],
+)
+async def test_non_streaming_response_preserves_unfinished_status(
+    status: str,
+    extra_fields: dict[str, JsonValue],
+) -> None:
+    response_body: dict[str, JsonValue] = {
+        "id": "resp_background",
+        "object": "response",
+        "status": status,
+        "output": [],
+        **extra_fields,
+    }
+    event_block, event_type = proxy_module._non_streaming_response_event(response_body)
 
     async def stream() -> AsyncIterator[str]:
         yield event_block
 
-    result = await proxy_api._collect_responses_payload(stream())
+    result = await proxy_api._collect_responses_payload(stream(), upstream_stream_false=True)
 
     assert event_type == f"response.{status}"
     assert isinstance(result, OpenAIResponsePayload)
     assert result.status == status
+    assert result.model_dump(mode="json", exclude_none=True) == response_body
 
 
 @pytest.mark.asyncio
-async def test_collect_responses_payload_does_not_treat_in_progress_as_terminal() -> None:
+async def test_collect_responses_payload_aggregated_bridge_keepalive_yields_completed_response() -> None:
+    completed_response: dict[str, JsonValue] = {
+        "id": "resp_background",
+        "object": "response",
+        "status": "completed",
+        "output": [],
+    }
+
+    async def stream() -> AsyncIterator[str]:
+        for event in (
+            {
+                "type": "response.created",
+                "response": {"id": "resp_background", "status": "in_progress"},
+            },
+            {
+                "type": "response.in_progress",
+                "response": {"id": "resp_background", "status": "in_progress"},
+            },
+            {"type": "response.completed", "response": completed_response},
+        ):
+            yield proxy_module.format_sse_event(event)
+
+    result = await proxy_api._collect_responses_payload(stream())
+
+    assert isinstance(result, OpenAIResponsePayload)
+    assert result.model_dump(mode="json", exclude_none=True) == completed_response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_body",
+    [
+        {"id": "resp_background", "status": "queued", "output": []},
+        {"id": "", "object": "response", "status": "queued", "output": []},
+        {"id": "   ", "object": "response", "status": "queued", "output": []},
+        {"id": " resp_background ", "object": "response", "status": "queued", "output": []},
+        {
+            "id": "resp_background",
+            "object": "response",
+            "status": "queued",
+            "output": [],
+            "usage": {"input_tokens": "invalid"},
+        },
+        {"id": "resp_background", "object": "response", "status": "queued", "output": [], "error": "boom"},
+    ],
+)
+async def test_collect_responses_payload_rejects_noncanonical_background_ack(
+    response_body: dict[str, JsonValue],
+) -> None:
+    async def stream() -> AsyncIterator[str]:
+        yield proxy_module.format_sse_event({"type": "response.queued", "response": response_body})
+
+    result = await proxy_api._collect_responses_payload(stream(), upstream_stream_false=True)
+
+    assert not isinstance(result, OpenAIResponsePayload)
+    assert result.error is not None
+    assert result.error.code == "invalid_json"
+
+
+@pytest.mark.asyncio
+async def test_collect_responses_payload_aggregated_in_progress_without_output_is_nonterminal() -> None:
     async def stream() -> AsyncIterator[str]:
         yield proxy_module.format_sse_event(
-            {"type": "response.in_progress", "response": {"id": "resp_background", "status": "in_progress"}}
+            {
+                "type": "response.in_progress",
+                "response": {"id": "resp_background", "object": "response", "status": "in_progress"},
+            }
         )
         yield proxy_module.format_sse_event(
             {
@@ -9444,6 +9523,47 @@ async def test_collect_responses_payload_does_not_treat_in_progress_as_terminal(
 
     assert isinstance(result, OpenAIResponsePayload)
     assert result.status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["response.queued", "response.in_progress"])
+async def test_collect_responses_payload_malformed_ack_is_terminal_before_completed(event_type: str) -> None:
+    async def stream() -> AsyncIterator[str]:
+        yield proxy_module.format_sse_event(
+            {"type": event_type, "response": {"id": "resp_background", "status": event_type.removeprefix("response.")}}
+        )
+        yield proxy_module.format_sse_event(
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_background", "status": "completed", "output": []},
+            }
+        )
+
+    result = await proxy_api._collect_responses_payload(stream(), upstream_stream_false=True)
+
+    assert not isinstance(result, OpenAIResponsePayload)
+    assert result.error is not None
+    assert result.error.code == "invalid_json"
+
+
+@pytest.mark.asyncio
+async def test_collect_responses_payload_malformed_ack_overrides_earlier_canonical_ack() -> None:
+    async def stream() -> AsyncIterator[str]:
+        yield proxy_module.format_sse_event(
+            {
+                "type": "response.queued",
+                "response": {"id": "resp_background", "object": "response", "status": "queued", "output": []},
+            }
+        )
+        yield proxy_module.format_sse_event(
+            {"type": "response.in_progress", "response": {"id": "resp_background", "status": "in_progress"}}
+        )
+
+    result = await proxy_api._collect_responses_payload(stream(), upstream_stream_false=True)
+
+    assert not isinstance(result, OpenAIResponsePayload)
+    assert result.error is not None
+    assert result.error.code == "invalid_json"
 
 
 @pytest.mark.parametrize(

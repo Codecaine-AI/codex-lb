@@ -30837,6 +30837,26 @@ async def test_http_bridge_retry_circuit_counts_stream_idle_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_ignores_suppressed_duplicate_terminal() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    hard_session = _make_bridge_session(key_value="bridge-duplicate-terminal-circuit")
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(return_value=None),
+        persist_retry_circuit=AsyncMock(),
+    )
+
+    result = await service._record_http_bridge_retry_circuit_failure(
+        hard_session,
+        detail="duplicate_tool_call_replay_suppressed",
+    )
+
+    assert result is None
+    assert hard_session.key not in cast(Any, service)._http_bridge_retry_circuits
+    service._durable_bridge.lookup_retry_circuit.assert_not_awaited()
+    service._durable_bridge.persist_retry_circuit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_retry_circuit_claims_one_attempt_once_across_concurrent_observers() -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     session = _make_bridge_session(key_value="bridge-attempt-concurrent")

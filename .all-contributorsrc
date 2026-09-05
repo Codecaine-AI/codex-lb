@@ -1381,6 +1381,16 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "kostazol",
+      "name": "kostazol",
+      "avatar_url": "https://avatars.githubusercontent.com/u/30263513?v=4",
+      "profile": "https://github.com/kostazol",
+      "contributions": [
+        "code",
+        "test"
+      ]
     }
   ],
   "contributorsPerLine": 7,

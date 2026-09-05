@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import ssl
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Mapping, NoReturn, Protocol, Sequence, cast
@@ -30,12 +31,21 @@ from app.core.clients.codex import (
     create_codex_session,
     require_route_or_direct_egress_opt_in,
 )
+from app.core.clients.native_egress import (
+    NativeEgressError,
+    NativeEgressTransportError,
+    NativeEgressUnavailable,
+    NativeEgressWebSocket,
+    NativeWebSocketRequest,
+    discover_native_egress_client,
+)
 from app.core.clients.proxy import (
     _CHATGPT_ACCOUNT_ID_HEADER,
     _HOP_BY_HOP_HEADER_NAMES,
     CODEX_INSTALLATION_ID_HEADER,
     ProxyResponseError,
     _is_native_codex_request,
+    _is_upstream_edge_challenge,
     _normalize_non_native_upstream_fingerprint,
     filter_inbound_headers,
 )
@@ -78,6 +88,9 @@ REALTIME_LIVE_CALL_ID_ROUTE_REGEX = (
     rf"|{_LIVE_CALL_UUID_CORE})"
 )
 _LIVE_CALL_ID_PATTERN = re.compile(rf"{REALTIME_LIVE_CALL_ID_ROUTE_REGEX}\Z")
+UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE = "upstream_websocket_liveness_timeout"
+_WEBSOCKETS_KEEPALIVE_TIMEOUT_REASON = "keepalive ping timeout"
+_AIOHTTP_HEARTBEAT_TIMEOUT_PREFIX = "No PONG received after "
 
 
 class RealtimeWebSocketProtocol(StrEnum):
@@ -99,16 +112,19 @@ class _UpstreamWebSocketPolicy:
     preserve_close_semantics: bool
 
 
+# Responses turns may be silent at the application layer for minutes, but a
+# healthy transport still answers ping control frames. Keep both watchdogs on:
+# disabling them turns a black-holed VPN route into a multi-hour request stall.
 _RESPONSES_WEBSOCKET_POLICY = _UpstreamWebSocketPolicy(
     operation="responses websocket",
     include_responses_beta=True,
     archive_payloads=True,
-    enable_routed_heartbeat=False,
+    enable_routed_heartbeat=True,
     retry_handshake_status=True,
     preserve_handshake_status=False,
     credential_safe_connect_errors=False,
     retry_routed_network_errors=True,
-    enable_direct_ping_timeout=False,
+    enable_direct_ping_timeout=True,
     preserve_close_semantics=False,
 )
 _LIVE_SIDEBAND_WEBSOCKET_POLICY = _UpstreamWebSocketPolicy(
@@ -124,6 +140,16 @@ _LIVE_SIDEBAND_WEBSOCKET_POLICY = _UpstreamWebSocketPolicy(
     preserve_close_semantics=True,
 )
 
+# Provenance proving the upstream websocket transport itself failed to come
+# up, as opposed to an account-, route-, or configuration-scoped connect
+# failure that happens to share the sanitized ``upstream_unavailable``
+# envelope. Only the direct upstream open can establish it: a routed open
+# proves nothing beyond the health of that one account's proxy endpoint, and
+# TLS verification failures and host-wide network loss are conditions that
+# switching the request to raw HTTP cannot route around.
+UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL = "upstream_websocket_transport_unavailable"
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -136,6 +162,24 @@ def normalize_realtime_call_id(value: str) -> str | None:
     if normalized.startswith(_LIVE_CALL_ID_RTC_PREFIX):
         return normalized
     return normalized.lower()
+
+
+def _consume_connection_lost_exception(done: asyncio.Future[Any]) -> None:
+    """Retrieve close exceptions before websockets shields the waiter.
+
+    websockets 16 waits on ``connection_lost_waiter`` through
+    ``asyncio.shield`` while completing ``ClientConnection.recv``.  A peer
+    keepalive/protocol close therefore leaves an exception on the waiter,
+    which asyncio reports as an ``exception in shielded future`` even though
+    ``recv`` translates it into an ``UpstreamWebSocketMessage``.  Consume it
+    at the adapter boundary; ``receive`` still classifies the close normally.
+    """
+    if done.cancelled():
+        return
+    try:
+        done.exception()
+    except asyncio.CancelledError:
+        return
 
 
 @dataclass(slots=True)
@@ -158,6 +202,8 @@ class UpstreamWebSocketTransportError(RuntimeError):
 
 
 def _websocket_transport_error_code(exc: BaseException, *, uses_proxy: bool) -> str:
+    if _is_websocket_liveness_timeout(exc):
+        return UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE
     return process_network_error_code(
         exc,
         fallback="upstream_unavailable",
@@ -165,12 +211,66 @@ def _websocket_transport_error_code(exc: BaseException, *, uses_proxy: bool) -> 
     )
 
 
+def is_account_neutral_websocket_error_code(error_code: str | None) -> bool:
+    """Return whether transport provenance rules out an account-health penalty."""
+
+    # These failures occur below the selected account's application protocol.
+    # They follow an ambiguous send, so relay owners must fail rather than
+    # replay while leaving the account eligible for unrelated requests. Keep
+    # the compatibility keepalive code here as long as adapters can emit it.
+    return error_code in {
+        PROCESS_NETWORK_UNAVAILABLE_CODE,
+        UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
+        "upstream_keepalive_timeout",
+    }
+
+
+def _is_websocket_liveness_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, ConnectionClosedError):
+        # websockets emits this locally-sent 1011 when its own ping watchdog
+        # expires. A peer may acknowledge it, leaving both close frames on the
+        # exception; send-first ordering still proves the marker came from our
+        # watchdog without trusting a peer that sends the same code and reason.
+        return (
+            exc.sent is not None
+            and int(exc.sent.code) == 1011
+            and exc.sent.reason == _WEBSOCKETS_KEEPALIVE_TIMEOUT_REASON
+            and (exc.rcvd is None or exc.rcvd_then_sent is False)
+        )
+    # aiohttp surfaces its heartbeat watchdog through WSMsgType.ERROR with a
+    # ServerTimeoutError carrying this library-defined prefix.
+    return isinstance(exc, aiohttp.ServerTimeoutError) and str(exc).startswith(_AIOHTTP_HEARTBEAT_TIMEOUT_PREFIX)
+
+
+def _aiohttp_stored_liveness_exception(websocket: Any) -> Exception | None:
+    # When aiohttp's heartbeat expires between receive() calls, no waiter is
+    # available for WSMsgType.ERROR. aiohttp stores the timeout instead and the
+    # next receive returns CLOSED, so every post-connect path must consult it.
+    exception_getter = getattr(websocket, "exception", None)
+    if not callable(exception_getter):
+        return None
+    exception = exception_getter()
+    return exception if isinstance(exception, Exception) and _is_websocket_liveness_timeout(exception) else None
+
+
 def _relay_receive_error_code(error_code: str) -> str | None:
-    """Expose only account-neutral process failures across the adapter boundary."""
+    """Expose account-neutral transport failures across the adapter boundary."""
 
     # Relay owners map an absent code to their established stream_incomplete
     # contract. Leaking the adapter's generic fallback would bypass that path.
-    return error_code if error_code == PROCESS_NETWORK_UNAVAILABLE_CODE else None
+    return error_code if is_account_neutral_websocket_error_code(error_code) else None
+
+
+def _is_keepalive_timeout_close(exc: ConnectionClosedError) -> bool:
+    """Classify peer/proxy heartbeat failures without exposing socket details."""
+
+    # Treat the legacy text marker as trusted only when this endpoint initiated
+    # the close. A peer can send the same public code and reason, so peer-first
+    # ordering must retain ordinary close/error semantics.
+    if exc.sent is None or (exc.rcvd is not None and exc.rcvd_then_sent is not False):
+        return False
+    reason = _close_reason_from_exception(exc)
+    return "keepalive ping timeout" in f"{exc} {reason or ''}".lower()
 
 
 async def _rotate_after_websocket_network_failure(error_code: str) -> None:
@@ -223,6 +323,9 @@ class WebsocketsUpstreamWebSocket:
         self._connection = connection
         self._uses_proxy = uses_proxy
         self._preserve_close_semantics = preserve_close_semantics
+        connection_lost_waiter = getattr(connection, "connection_lost_waiter", None)
+        if isinstance(connection_lost_waiter, asyncio.Future):
+            connection_lost_waiter.add_done_callback(_consume_connection_lost_exception)
 
     async def send_text(self, text: str) -> None:
         try:
@@ -254,6 +357,12 @@ class WebsocketsUpstreamWebSocket:
                 )
             error_code = _websocket_transport_error_code(exc, uses_proxy=self._uses_proxy)
             await _rotate_after_websocket_network_failure(error_code)
+            relay_error_code = _relay_receive_error_code(error_code)
+            if relay_error_code is None and _is_keepalive_timeout_close(exc):
+                # Prefer the stable, provenance-checked watchdog code above.
+                # This text fallback preserves compatibility with keepalive
+                # failures whose exception shape lacks the local-send marker.
+                relay_error_code = "upstream_keepalive_timeout"
             # ConnectionClosedError describes an incomplete close handshake,
             # not generic transport provenance. Let Responses relay owners map
             # it to stream_incomplete while live relays preserve received closes.
@@ -265,7 +374,7 @@ class WebsocketsUpstreamWebSocket:
                     if self._preserve_close_semantics
                     else str(exc)
                 ),
-                error_code=_relay_receive_error_code(error_code),
+                error_code=relay_error_code,
             )
         except Exception as exc:
             error_code = _websocket_transport_error_code(exc, uses_proxy=self._uses_proxy)
@@ -300,6 +409,67 @@ class WebsocketsUpstreamWebSocket:
         return str(value)
 
 
+class NativeUpstreamWebSocket:
+    """Expose a native-helper WebSocket through the existing relay protocol."""
+
+    def __init__(self, websocket: NativeEgressWebSocket) -> None:
+        self._websocket = websocket
+
+    async def send_text(self, text: str) -> None:
+        try:
+            await self._websocket.send_text(text)
+        except NativeEgressError as exc:
+            raise _native_websocket_transport_error(exc, operation="send") from None
+
+    async def send_bytes(self, data: bytes) -> None:
+        try:
+            await self._websocket.send_bytes(data)
+        except NativeEgressError as exc:
+            raise _native_websocket_transport_error(exc, operation="send") from None
+
+    async def receive(self) -> UpstreamWebSocketMessage:
+        try:
+            message = await self._websocket.receive()
+        except NativeEgressError as exc:
+            error = _native_websocket_transport_error(exc, operation="receive")
+            return UpstreamWebSocketMessage(
+                kind="error",
+                error=str(error),
+                error_code=_relay_receive_error_code(error.error_code),
+            )
+        return UpstreamWebSocketMessage(
+            kind=message.kind,
+            text=message.text,
+            data=message.data,
+            close_code=message.close_code,
+            close_reason=message.close_reason,
+        )
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        await self._websocket.close(code=code, reason=reason)
+
+    def response_header(self, name: str) -> str | None:
+        return self._websocket.response_header(name)
+
+
+def _native_websocket_transport_error(
+    exc: NativeEgressError,
+    *,
+    operation: str,
+) -> UpstreamWebSocketTransportError:
+    phase = exc.failure_phase if isinstance(exc, NativeEgressTransportError) else "protocol"
+    if phase == "liveness_timeout":
+        return UpstreamWebSocketTransportError(
+            f"Upstream websocket {operation} failed",
+            error_code=UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
+        )
+    account_neutral = phase in {"helper_exit", "helper_read", "helper_write", "shutdown"}
+    return UpstreamWebSocketTransportError(
+        f"Upstream websocket {operation} failed",
+        error_code=PROCESS_NETWORK_UNAVAILABLE_CODE if account_neutral else "upstream_unavailable",
+    )
+
+
 class CodexUpstreamWebSocket:
     def __init__(
         self,
@@ -324,7 +494,8 @@ class CodexUpstreamWebSocket:
             if asyncio.iscoroutine(result):
                 await result
         except Exception as exc:
-            await _raise_websocket_send_error(exc, endpoint_id=self._endpoint_id, uses_proxy=True)
+            classification_exc = _aiohttp_stored_liveness_exception(self._websocket) or exc
+            await _raise_websocket_send_error(classification_exc, endpoint_id=self._endpoint_id, uses_proxy=True)
 
     async def send_bytes(self, data: bytes) -> None:
         try:
@@ -332,27 +503,43 @@ class CodexUpstreamWebSocket:
             if asyncio.iscoroutine(result):
                 await result
         except Exception as exc:
-            await _raise_websocket_send_error(exc, endpoint_id=self._endpoint_id, uses_proxy=True)
+            classification_exc = _aiohttp_stored_liveness_exception(self._websocket) or exc
+            await _raise_websocket_send_error(classification_exc, endpoint_id=self._endpoint_id, uses_proxy=True)
 
     async def receive(self) -> UpstreamWebSocketMessage:
         try:
             msg = await self._websocket.receive()
         except Exception as exc:
-            error_code = _websocket_transport_error_code(exc, uses_proxy=True)
+            classification_exc = _aiohttp_stored_liveness_exception(self._websocket) or exc
+            error_code = _websocket_transport_error_code(classification_exc, uses_proxy=True)
             await _rotate_after_websocket_network_failure(error_code)
             return UpstreamWebSocketMessage(
                 kind="error",
-                error=codex_transport_error_message("websocket receive", self._endpoint_id, exc),
+                error=codex_transport_error_message("websocket receive", self._endpoint_id, classification_exc),
                 error_code=_relay_receive_error_code(error_code),
             )
         if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+            liveness_exception = _aiohttp_stored_liveness_exception(self._websocket)
+            if liveness_exception is not None:
+                return UpstreamWebSocketMessage(
+                    kind="error",
+                    close_code=_aiohttp_ws_close_code(self._websocket, msg),
+                    error=codex_transport_error_message(
+                        "websocket receive",
+                        self._endpoint_id,
+                        liveness_exception,
+                    ),
+                    error_code=UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
+                )
             return UpstreamWebSocketMessage(
                 kind="close",
                 close_code=_aiohttp_ws_close_code(self._websocket, msg),
                 close_reason=_aiohttp_ws_close_reason(msg),
             )
         if msg.type == aiohttp.WSMsgType.ERROR:
-            exception = msg.data if isinstance(msg.data, BaseException) else None
+            exception = (
+                msg.data if isinstance(msg.data, Exception) else _aiohttp_stored_liveness_exception(self._websocket)
+            )
             error_code = (
                 _websocket_transport_error_code(exception, uses_proxy=True)
                 if exception is not None
@@ -724,6 +911,7 @@ async def _connect_upstream_websocket(
                     timeout=settings.upstream_connect_timeout_seconds,
                     max_msg_size=settings.max_sse_event_bytes,
                     heartbeat=heartbeat,
+                    compress=15,
                     **protocol_kwargs,
                 )
                 context = result.context
@@ -731,6 +919,7 @@ async def _connect_upstream_websocket(
                 endpoint_id = result.route.endpoint_id
                 active_route = result.route
                 fallback_used = result.fallback_used
+                native_routed = bool(getattr(result, "native", False))
             else:
                 context = await active_codex_client.ws_connect(
                     url,
@@ -739,12 +928,14 @@ async def _connect_upstream_websocket(
                     timeout=settings.upstream_connect_timeout_seconds,
                     max_msg_size=settings.max_sse_event_bytes,
                     heartbeat=heartbeat,
+                    compress=15,
                     **protocol_kwargs,
                 )
                 websocket = await context.__aenter__() if hasattr(context, "__aenter__") else context
                 if not hasattr(context, "__aenter__"):
                     context = None
                 endpoint_id = route.endpoint_id
+                native_routed = False
         except asyncio.CancelledError:
             if owns_codex_client:
                 try:
@@ -769,14 +960,45 @@ async def _connect_upstream_websocket(
                 status_code if policy.preserve_handshake_status else 502,
                 openai_error(error_code, message, error_type="server_error"),
                 failure_phase="connect",
+                # Carry the client's dispatch provenance across the sanitizing
+                # boundary: a typed connector failure against the routed proxy
+                # proves no ``response.create`` frame could have reached
+                # upstream, so service-level failover may replay the request
+                # on another account. TLS verification failures are stable
+                # endpoint configuration errors and stay non-replayable.
                 retryable_same_contract=(
-                    policy.retry_routed_network_errors and error_code == PROCESS_NETWORK_UNAVAILABLE_CODE
+                    (policy.retry_routed_network_errors and error_code == PROCESS_NETWORK_UNAVAILABLE_CODE)
+                    or (exc.retryable_same_contract and not exc.is_tls_verification_failure)
                 ),
+                failure_detail=(
+                    "proxy_connect_pre_dispatch"
+                    if exc.retryable_same_contract and not exc.is_tls_verification_failure
+                    else "transport_error"
+                ),
+                failure_exception_type=type(exc).__name__,
             ) from exc
         except Exception:
             if owns_codex_client:
                 await active_codex_client.close()
             raise
+        if native_routed:
+            if owns_codex_client:
+                try:
+                    await active_codex_client.close()
+                except Exception:
+                    logger.warning(
+                        "Failed to close owned Codex client after native websocket connect",
+                        exc_info=True,
+                    )
+            return ArchivingUpstreamWebSocket(
+                NativeUpstreamWebSocket(cast(NativeEgressWebSocket, websocket)),
+                url=url,
+                headers=upstream_headers,
+                account_id=account_id,
+                route=active_route,
+                fallback_used=fallback_used,
+                archive_payloads=policy.archive_payloads,
+            )
         return ArchivingUpstreamWebSocket(
             CodexUpstreamWebSocket(
                 websocket,
@@ -793,20 +1015,63 @@ async def _connect_upstream_websocket(
             fallback_used=fallback_used,
             archive_payloads=policy.archive_payloads,
         )
+    # Ping/pong control frames verify transport liveness without treating valid
+    # application-frame silence as an idle response.
+    ping_timeout = (
+        settings.proxy_downstream_websocket_idle_timeout_seconds if policy.enable_direct_ping_timeout else None
+    )
+    native_client = discover_native_egress_client()
+    if native_client is not None:
+        native_headers = dict(upstream_headers)
+        if subprotocols:
+            native_headers["sec-websocket-protocol"] = ", ".join(subprotocols)
+        proxy_env = (
+            settings.upstream_websocket_proxy_env() if hasattr(settings, "upstream_websocket_proxy_env") else os.environ
+        )
+        proxy_url = resolve_websocket_proxy_from_env(url, proxy_env) if settings.upstream_websocket_trust_env else None
+        try:
+            native_websocket = await native_client.websocket(
+                NativeWebSocketRequest(
+                    url=url,
+                    headers=native_headers,
+                    connect_timeout_seconds=settings.upstream_connect_timeout_seconds,
+                    max_message_bytes=settings.max_sse_event_bytes,
+                    ping_interval_seconds=20.0,
+                    ping_timeout_seconds=ping_timeout,
+                    proxy_url=proxy_url,
+                )
+            )
+        except NativeEgressUnavailable:
+            # Startup failed before the handshake command could be dispatched;
+            # retain zero-configuration behavior for non-container installs.
+            pass
+        except NativeEgressTransportError as exc:
+            raise _native_websocket_handshake_error(exc, policy=policy) from exc
+        except NativeEgressError as exc:
+            raise ProxyResponseError(
+                502,
+                openai_error(
+                    "upstream_unavailable",
+                    "Invalid upstream websocket handshake",
+                    error_type="server_error",
+                ),
+                failure_phase="connect",
+            ) from exc
+        else:
+            return ArchivingUpstreamWebSocket(
+                NativeUpstreamWebSocket(native_websocket),
+                url=url,
+                headers=native_headers,
+                account_id=account_id,
+                direct_egress=allow_direct_egress,
+                archive_payloads=policy.archive_payloads,
+            )
     origin = cast(Origin | None, _pop_header_case_insensitive(upstream_headers, "origin"))
     user_agent = _pop_header_case_insensitive(upstream_headers, "user-agent")
     proxy_env = (
         settings.upstream_websocket_proxy_env() if hasattr(settings, "upstream_websocket_proxy_env") else os.environ
     )
     proxy_url = resolve_websocket_proxy_from_env(url, proxy_env) if settings.upstream_websocket_trust_env else None
-    # Long Responses turns can spend minutes without application frames,
-    # so that existing transport keeps its own watchdog disabled. Live
-    # sideband traffic uses ping/pong liveness rather than an application-
-    # frame idle timeout because WebRTC media may remain healthy while the
-    # sideband itself is silent.
-    ping_timeout = (
-        settings.proxy_downstream_websocket_idle_timeout_seconds if policy.enable_direct_ping_timeout else None
-    )
     try:
         subprotocol_kwargs = {"subprotocols": cast(Sequence[Subprotocol], subprotocols)} if subprotocols else {}
         response = await websocket_connect(
@@ -818,15 +1083,26 @@ async def _connect_upstream_websocket(
             ping_timeout=ping_timeout,
             max_size=settings.max_sse_event_bytes,
             proxy=proxy_url,
+            # Codex offers permessage-deflate on its upstream handshake. Keep
+            # the direct path's default offer aligned with the routed aiohttp
+            # path (``compress=15`` above).
+            compression="deflate",
             **subprotocol_kwargs,
         )
     except asyncio.TimeoutError as exc:
         raise ProxyResponseError(
             502,
             openai_error("upstream_unavailable", "Request to upstream timed out"),
+            failure_phase="connect",
+            failure_detail=UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL,
         ) from exc
     except InvalidStatus as exc:
         response = exc.response
+        is_edge_challenge = _is_upstream_edge_challenge(
+            response.status_code,
+            headers=response.headers,
+            body=response.body,
+        )
         if policy.credential_safe_connect_errors:
             status_code = response.status_code if 400 <= response.status_code <= 599 else 502
             payload = openai_error(
@@ -842,16 +1118,31 @@ async def _connect_upstream_websocket(
             status_code,
             payload,
             failure_phase="connect",
+            # A 5xx upgrade rejection is the edge refusing to carry websockets
+            # at all. The sanitized code cannot carry that provenance: this
+            # policy preserves the upstream body, so the same outage surfaces
+            # as ``upstream_error`` or whatever code the edge returned.
+            # Credential-scoped rejections (401/403/429) stay account evidence,
+            # with one narrow exception: a 403 carrying explicit Cloudflare
+            # edge-challenge evidence is the edge refusing the websocket
+            # upgrade itself, not a verdict on the account, so it shares the
+            # transport-failure provenance and steers clients to HTTP.
+            failure_detail=(
+                UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL if status_code >= 500 or is_edge_challenge else None
+            ),
         ) from exc
     except InvalidProxy as exc:
-        message = (
-            "Invalid upstream websocket proxy configuration"
-            if policy.credential_safe_connect_errors
-            else (str(exc) or "Invalid upstream websocket proxy configuration")
-        )
+        # str(exc) embeds the full proxy URL including userinfo; the URL is
+        # operator configuration, never actionable for the API client. The
+        # websockets reason (``exc.msg``) never contains the URL.
+        logger.warning("%s rejected upstream websocket proxy configuration: %s", policy.operation, exc.msg)
         raise ProxyResponseError(
             502,
-            openai_error("upstream_unavailable", message, error_type="server_error"),
+            openai_error(
+                "upstream_unavailable",
+                "Invalid upstream websocket proxy configuration",
+                error_type="server_error",
+            ),
         ) from exc
     except InvalidHandshake as exc:
         message = (
@@ -862,6 +1153,8 @@ async def _connect_upstream_websocket(
         raise ProxyResponseError(
             502,
             openai_error("upstream_unavailable", message),
+            failure_phase="connect",
+            failure_detail=UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL,
         ) from exc
     except OSError as exc:
         error_code = process_network_error_code(
@@ -875,6 +1168,15 @@ async def _connect_upstream_websocket(
             openai_error(error_code, message),
             failure_phase="connect",
             retryable_same_contract=error_code == PROCESS_NETWORK_UNAVAILABLE_CODE,
+            # Host-wide network loss keeps its account-neutral process
+            # recovery path, and a TLS verification failure is stable endpoint
+            # configuration; neither is an upstream websocket outage that raw
+            # HTTP can route around.
+            failure_detail=(
+                None
+                if error_code == PROCESS_NETWORK_UNAVAILABLE_CODE or isinstance(exc, ssl.SSLError)
+                else UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL
+            ),
         ) from exc
 
     return ArchivingUpstreamWebSocket(
@@ -888,6 +1190,48 @@ async def _connect_upstream_websocket(
         account_id=account_id,
         direct_egress=allow_direct_egress,
         archive_payloads=policy.archive_payloads,
+    )
+
+
+def _native_websocket_handshake_error(
+    exc: NativeEgressTransportError,
+    *,
+    policy: _UpstreamWebSocketPolicy,
+) -> ProxyResponseError:
+    status_code = exc.status_code if exc.status_code is not None and 400 <= exc.status_code <= 599 else 502
+    if policy.credential_safe_connect_errors:
+        message = (
+            f"Upstream websocket handshake failed with HTTP {status_code}"
+            if exc.status_code is not None
+            else "Upstream websocket connection failed"
+        )
+        payload = openai_error(
+            "upstream_websocket_handshake_failed" if exc.status_code is not None else "upstream_unavailable",
+            message,
+            error_type="server_error",
+        )
+    elif exc.status_code is not None:
+        headers = Headers(exc.headers)
+        payload = _handshake_error_payload(
+            status_code,
+            f"Upstream websocket error: HTTP {status_code}",
+            headers,
+            exc.body,
+        )
+    else:
+        message = (
+            "Request to upstream timed out"
+            if exc.failure_phase == "timeout"
+            else "Upstream websocket connection failed"
+        )
+        payload = openai_error("upstream_unavailable", message, error_type="server_error")
+    return ProxyResponseError(
+        status_code if policy.preserve_handshake_status else 502,
+        payload,
+        failure_phase="connect",
+        retryable_same_contract=exc.retryable_same_contract,
+        failure_detail="native_websocket_pre_dispatch" if exc.retryable_same_contract else "transport_error",
+        failure_exception_type=type(exc).__name__,
     )
 
 

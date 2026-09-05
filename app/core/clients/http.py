@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
+import socket
 import ssl
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -12,6 +14,7 @@ from types import TracebackType
 
 import aiohttp
 import certifi
+from aiohappyeyeballs.types import AddrInfoType
 from aiohttp_retry import RetryClient
 from aiohttp_socks import ProxyConnector
 
@@ -48,6 +51,16 @@ _retired_http_clients: list[_ManagedHttpClient] = []
 _closing_http_clients: list[_ManagedHttpClient] = []
 _last_generationless_network_rotation_at: float | None = None
 _GENERATIONLESS_NETWORK_ROTATION_COOLDOWN_SECONDS = 1.0
+
+# Pooled upstream connections outlive the request that opened them, so a socket
+# dropped by an intermediary (NAT rebind, tunnel reconnect, route change) is
+# otherwise only discovered when an application-level timeout fires. Probes turn
+# that silent black hole into a transport error the failover paths already
+# handle. Idle/interval/count are chosen to declare a dead peer in ~90s, which
+# matches the pooled keepalive window below.
+_TCP_KEEPALIVE_IDLE_SECONDS = 30
+_TCP_KEEPALIVE_INTERVAL_SECONDS = 10
+_TCP_KEEPALIVE_PROBE_COUNT = 6
 
 
 def _socks_proxy_config(environ: Mapping[str, str | None] = os.environ) -> _SocksProxyConfig | None:
@@ -95,6 +108,65 @@ def _build_ssl_context() -> ssl.SSLContext:
     return context
 
 
+@functools.cache
+def _shared_ssl_context() -> ssl.SSLContext:
+    """Return the process-wide verification context shared by every outbound connector.
+
+    Building a context parses the system store plus the certifi bundle
+    (~7 ms CPU and ~700 KB per copy), and nothing mutates the context after
+    construction, so per-call sessions, SOCKS connectors, and the shared
+    client generations all reuse this one instance. ``_build_ssl_context`` is
+    looked up at call time so tests can still patch the constructor; the
+    cache is cleared by ``_reset_shared_ssl_context``.
+    """
+
+    return _build_ssl_context()
+
+
+def _reset_shared_ssl_context() -> None:
+    _shared_ssl_context.cache_clear()
+
+
+def _apply_tcp_keepalive(sock: socket.socket) -> None:
+    """Enable OS keepalive probes on an upstream socket.
+
+    Probe tuning is best-effort by design: ``TCP_KEEPIDLE`` is Linux-only,
+    macOS spells the same knob ``TCP_KEEPALIVE``, and other platforms may
+    expose neither. Failing client construction over a missing socket option
+    would trade a rare hang for a certain outage, so unsupported knobs are
+    skipped and only the enable step is required.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        logger.debug("Upstream socket rejected SO_KEEPALIVE", exc_info=True)
+        return
+    for option_name, option_value in (
+        ("TCP_KEEPIDLE", _TCP_KEEPALIVE_IDLE_SECONDS),
+        ("TCP_KEEPALIVE", _TCP_KEEPALIVE_IDLE_SECONDS),
+        ("TCP_KEEPINTVL", _TCP_KEEPALIVE_INTERVAL_SECONDS),
+        ("TCP_KEEPCNT", _TCP_KEEPALIVE_PROBE_COUNT),
+    ):
+        option = getattr(socket, option_name, None)
+        if option is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, option, option_value)
+        except OSError:
+            logger.debug("Upstream socket rejected %s", option_name, exc_info=True)
+
+
+def _keepalive_socket_factory(addr_info: AddrInfoType) -> socket.socket:
+    family, socket_type, proto = addr_info[0], addr_info[1], addr_info[2]
+    sock = socket.socket(family=family, type=socket_type, proto=proto)
+    try:
+        _apply_tcp_keepalive(sock)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
 class HttpClientLease:
     def __init__(self, managed_client: _ManagedHttpClient) -> None:
         self.client = managed_client.client
@@ -121,7 +193,7 @@ class HttpClientLease:
 
 async def _build_http_client() -> HttpClient:
     settings = get_settings()
-    ssl_context = _build_ssl_context()
+    ssl_context = _shared_ssl_context()
     proxy_env = (
         settings.upstream_websocket_proxy_env() if hasattr(settings, "upstream_websocket_proxy_env") else os.environ
     )
@@ -133,6 +205,7 @@ async def _build_http_client() -> HttpClient:
             limit_per_host=settings.http_connector_limit_per_host,
             ssl=ssl_context,
             rdns=socks_config.rdns,
+            socket_factory=_keepalive_socket_factory,
         )
     else:
         connector = aiohttp.TCPConnector(
@@ -146,6 +219,7 @@ async def _build_http_client() -> HttpClient:
             # around across turns instead.
             keepalive_timeout=90,
             ttl_dns_cache=300,
+            socket_factory=_keepalive_socket_factory,
         )
     session = aiohttp.ClientSession(
         connector=connector,
@@ -158,10 +232,16 @@ async def _build_http_client() -> HttpClient:
                 socks_config.connector_url,
                 ssl=ssl_context,
                 rdns=socks_config.rdns,
+                socket_factory=_keepalive_socket_factory,
             )
             ws_trust_env = False
         else:
-            ws_connector = aiohttp.TCPConnector(ssl=ssl_context, keepalive_timeout=90, ttl_dns_cache=300)
+            ws_connector = aiohttp.TCPConnector(
+                ssl=ssl_context,
+                keepalive_timeout=90,
+                ttl_dns_cache=300,
+                socket_factory=_keepalive_socket_factory,
+            )
             ws_trust_env = settings.upstream_websocket_trust_env
         try:
             websocket_session = aiohttp.ClientSession(
@@ -337,6 +417,7 @@ async def close_http_client() -> None:
         client = _http_client
         _http_client = None
         _last_generationless_network_rotation_at = None
+        _reset_shared_ssl_context()
         clients = (
             *((client,) if client is not None else ()),
             *_retired_http_clients,

@@ -17,7 +17,7 @@ from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.proxy.account_cache import AccountSelectionCache
 from app.modules.proxy.load_balancer import AccountConcurrencyCaps, AccountSelection, LoadBalancer
 from app.modules.proxy.repo_bundle import ProxyRepositories
-from app.modules.proxy.sticky_repository import StickySessionsRepository
+from app.modules.proxy.sticky_repository import StickyOwnerLookup, StickySessionsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
@@ -139,6 +139,11 @@ class _StickySessionsRepository:
         self.get_calls += 1
         return self.account_id
 
+    async def get_account_id_and_abandonment(self, *args: Any, **kwargs: Any) -> StickyOwnerLookup:
+        del args, kwargs
+        self.get_calls += 1
+        return StickyOwnerLookup(account_id=self.account_id, continuity_abandoned=False)
+
     async def upsert(
         self,
         key: str,
@@ -215,6 +220,58 @@ async def test_public_selection_returns_a_detached_success(selection_cache: Acco
 
     selection.account.email = "mutated@example.com"
     assert persisted.email == "contract-success@example.com"
+
+
+@pytest.mark.asyncio
+async def test_public_selection_with_default_fair_share_kwargs_matches_default_behavior(
+    selection_cache: AccountSelectionCache,
+) -> None:
+    persisted = _account("contract-fair-share-default")
+    balancer, _, _, _ = _balancer([persisted], selection_cache)
+
+    implicit = await balancer.select_account(routing_strategy="usage_weighted")
+    explicit = await balancer.select_account(
+        routing_strategy="usage_weighted",
+        api_key_id=None,
+        api_key_stream_fair_share_threshold_pct=0,
+    )
+
+    assert implicit.account is not None
+    assert explicit.account is not None
+    assert implicit.account.id == explicit.account.id == persisted.id
+    assert (explicit.error_message, explicit.error_code) == (implicit.error_message, implicit.error_code)
+    assert explicit.error_message is None
+    assert explicit.error_code is None
+    assert explicit.lease is None
+
+
+@pytest.mark.asyncio
+async def test_public_selection_surfaces_fair_share_denial_shape(
+    selection_cache: AccountSelectionCache,
+) -> None:
+    account = _account("contract-fair-share-denied")
+    balancer, _, _, _ = _balancer([account], selection_cache)
+    # Pool capacity is 1 (one account, stream cap 1). A pre-loaded runtime puts
+    # the requester at 2 in-flight streams: congested at threshold 100
+    # (2 * 100 >= 1 * 100) and over its share of max(2, 1 // 1) = 2.
+    balancer._runtime[account.id] = load_balancer_module.RuntimeState(
+        inflight_streams=2,
+        stream_key_inflight={"k1": 2},
+    )
+
+    selection = await balancer.select_account(
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+        concurrency_caps=_CONCURRENCY_CAPS,
+        api_key_id="k1",
+        api_key_stream_fair_share_threshold_pct=100,
+    )
+
+    assert selection.account is None
+    assert selection.lease is None
+    assert selection.error_code == "api_key_stream_fair_share"
+    assert selection.error_message is not None
+    assert "fair share" in selection.error_message
 
 
 @pytest.mark.asyncio
@@ -313,6 +370,7 @@ async def test_deleted_required_continuity_owner_returns_typed_miss_without_glob
     assert selection.account is None
     assert selection.error_message == "Required continuity owner account no longer exists"
     assert selection.error_code == load_balancer_module.CONTINUITY_OWNER_UNAVAILABLE
+    assert selection.continuity_owner_no_longer_exists is True
     assert degraded_reasons == []
     assert normal_calls == []
 
@@ -513,6 +571,41 @@ async def test_hard_sticky_owner_miss_does_not_mark_healthy_pool_degraded(
     assert selection.error_code == "hard_affinity_saturated"
     assert degraded_reasons == []
     assert normal_calls == []
+
+
+@pytest.mark.asyncio
+async def test_required_continuity_owner_preserves_transient_hard_affinity_saturation(
+    selection_cache: AccountSelectionCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _account("contract-required-sticky-owner")
+    balancer, _, _, sticky_repo = _balancer([owner], selection_cache)
+    sticky_repo.account_id = owner.id
+
+    async def saturated_selection(_owner: object, *, request: Any) -> object:
+        return SimpleNamespace(
+            selection_inputs=request.selection_inputs,
+            selected_snapshot=None,
+            selected_lease=None,
+            error_message="Hard affinity owner account is unavailable",
+            error_code="hard_affinity_saturated",
+            resets_at=None,
+            disposition="shared_result",
+        )
+
+    monkeypatch.setattr(load_balancer_module, "run_sticky_selection_path", saturated_selection)
+
+    selection = await balancer.select_account(
+        sticky_key="hard-required-owned-turn-state",
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        required_account_id=owner.id,
+        required_continuity_owner=True,
+        lease_kind="stream",
+    )
+
+    assert selection.account is None
+    assert selection.error_message == "Hard affinity owner account is unavailable"
+    assert selection.error_code == "hard_affinity_saturated"
 
 
 @pytest.mark.asyncio

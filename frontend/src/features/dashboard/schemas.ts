@@ -16,6 +16,15 @@ export function parseOverviewTimeframe(value: string | null | undefined): Overvi
   return parsed.success ? parsed.data : DEFAULT_OVERVIEW_TIMEFRAME;
 }
 
+const ConversationTimeframeKeySchema = z.enum(["1d", "7d", "30d"]);
+export type ConversationTimeframe = z.infer<typeof ConversationTimeframeKeySchema>;
+export const DEFAULT_CONVERSATION_TIMEFRAME: ConversationTimeframe = "7d";
+
+export function parseConversationTimeframe(value: string | null | undefined): ConversationTimeframe {
+  const parsed = ConversationTimeframeKeySchema.safeParse(value);
+  return parsed.success ? parsed.data : DEFAULT_CONVERSATION_TIMEFRAME;
+}
+
 const UsageHistoryItemSchema = z.object({
   accountId: z.string(),
   remainingPercentAvg: z.number().nullable(),
@@ -55,6 +64,7 @@ const DashboardMetricsSchema = z.object({
   cachedInputTokens: z.number().nullable(),
   errorRate: z.number().nullable(),
   errorCount: z.number().nullable(),
+  cancelledCount: z.number().int().nonnegative().nullable().optional(),
   topError: z.string().nullable(),
   conversations: z.number().int().nullable().optional().default(null),
   conversationRequests: z.number().int().nonnegative().optional().default(0),
@@ -93,6 +103,24 @@ export const DepletionSchema = z.object({
   secondsUntilExhaustion: z.number().nullable().optional(),
 });
 
+const WeeklyCreditResetEventSchema = z.object({
+  at: z.iso.datetime({ offset: true }),
+  creditsReturned: z.number(),
+});
+
+const WeeklyCreditApiKeyAttributionSchema = z.object({
+  // Stable key id; absent on backends that predate per-key attribution ids.
+  apiKeyId: z.string().nullable().optional(),
+  name: z.string(),
+  requests: z.number().int().nonnegative(),
+  billableTokens: z.number().int().nonnegative(),
+  cachedTokens: z.number().int().nonnegative(),
+  dominantModel: z.string(),
+});
+
+const WeeklyCreditPaceStatusSchema = z.enum(["behind", "on_track", "ahead", "danger"]);
+const WeeklyCreditRunwayStatusSchema = z.enum(["safe", "tight", "runs_dry"]);
+
 const WeeklyCreditPaceSchema = z.object({
   totalFullCredits: z.number(),
   totalActualRemainingCredits: z.number(),
@@ -116,7 +144,19 @@ const WeeklyCreditPaceSchema = z.object({
   projectedMinimumRemainingCredits: z.number().nullable(),
   forecastBurnRateCreditsPerHour: z.number().nullable(),
   scheduledBurnRateCreditsPerHour: z.number(),
-  status: z.enum(["behind", "on_track", "ahead", "danger"]),
+  // Runway fields (additive; optional so older backends still parse).
+  headroomPercent: z.number().optional(),
+  headroomCredits: z.number().optional(),
+  burnRateRecentCreditsPerHour: z.number().nullable().optional(),
+  depletionEtaHours: z.number().nullable().optional(),
+  nextReliefInHours: z.number().nullable().optional(),
+  nextReliefCredits: z.number().nullable().optional(),
+  resetEvents: z.array(WeeklyCreditResetEventSchema).optional(),
+  runwayStatus: WeeklyCreditRunwayStatusSchema.optional(),
+  saturatedAccountCount: z.number().int().nonnegative().optional(),
+  topApiKeys: z.array(WeeklyCreditApiKeyAttributionSchema).optional(),
+  addProAccounts: z.number().int().nullable().optional(),
+  status: WeeklyCreditPaceStatusSchema,
   accountCount: z.number().int().nonnegative(),
   staleAccountCount: z.number().int().nonnegative(),
   inactiveAccountCount: z.number().int().nonnegative(),
@@ -167,12 +207,18 @@ export const RequestLogSchema = z.object({
   requestId: z.string(),
   archiveRequestId: z.string().nullable().optional(),
   requestKind: z.enum(["normal", "warmup", "limit_warmup", "prewarm", "compaction", "realtime_live"]).optional().default("normal"),
+  connectionRequestKind: z.enum(["normal", "prewarm"]).nullable().optional(),
   model: z.string(),
   source: z.string().nullable().optional().default(null),
   modelSourceId: z.string().nullable().optional(),
   modelSourceKind: z.string().nullable().optional(),
   transport: z.string().nullable().optional().default(null),
   upstreamTransport: z.string().nullable().optional(),
+  upstreamProxyRouteMode: z.string().nullable().optional(),
+  upstreamProxyPoolId: z.string().nullable().optional(),
+  upstreamProxyEndpointId: z.string().nullable().optional(),
+  upstreamProxyFallbackUsed: z.boolean().nullable().optional(),
+  upstreamProxyFailClosedReason: z.string().nullable().optional(),
   useragent: z.string().nullable().optional().default(null),
   useragentGroup: z.string().nullable().optional().default(null),
   clientIp: z.string().nullable().optional().default(null),
@@ -231,9 +277,12 @@ export const RequestLogFilterOptionsSchema = z.object({
   statuses: z.array(z.string()),
 });
 
+const RequestLogTimeframeSchema = z.enum(["all", "1h", "24h", "7d"]);
+export type RequestLogTimeframe = z.infer<typeof RequestLogTimeframeSchema>;
+
 export const FilterStateSchema = z.object({
   search: z.string(),
-  timeframe: z.enum(["all", "1h", "24h", "7d"]),
+  timeframe: RequestLogTimeframeSchema,
   accountIds: z.array(z.string()),
   apiKeyIds: z.array(z.string()),
   modelOptions: z.array(z.string()),
@@ -257,3 +306,77 @@ export type RequestLogFilterOptions = z.infer<typeof RequestLogFilterOptionsSche
 export type FilterState = z.infer<typeof FilterStateSchema>;
 export type Depletion = z.infer<typeof DepletionSchema>;
 export type ServerWeeklyCreditPace = z.infer<typeof WeeklyCreditPaceSchema>;
+export type WeeklyCreditResetEvent = z.infer<typeof WeeklyCreditResetEventSchema>;
+export type WeeklyCreditApiKeyAttribution = z.infer<typeof WeeklyCreditApiKeyAttributionSchema>;
+export type WeeklyCreditPaceStatus = z.infer<typeof WeeklyCreditPaceStatusSchema>;
+export type WeeklyCreditRunwayStatus = z.infer<typeof WeeklyCreditRunwayStatusSchema>;
+
+export const DashboardViewSchema = z.enum(["request-logs", "conversations"]);
+export type DashboardView = z.infer<typeof DashboardViewSchema>;
+export const DEFAULT_DASHBOARD_VIEW: DashboardView = "request-logs";
+
+export function parseDashboardView(value: string | null | undefined): DashboardView {
+  const parsed = DashboardViewSchema.safeParse(value);
+  return parsed.success ? parsed.data : DEFAULT_DASHBOARD_VIEW;
+}
+
+const ConversationModelEffortSchema = z.object({
+  model: z.string(),
+  reasoningEffort: z.string().nullable().optional().default(null),
+});
+
+export const ConversationModelStatSchema = z.object({
+  modelEffort: ConversationModelEffortSchema,
+  reqs: z.number().int().nonnegative(),
+  totalElapsedTime: z.number().int().nonnegative(),
+  totalInputTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative().nullable(),
+  totalOutputTokens: z.number().int().nonnegative(),
+  totalCostUsd: z.number(),
+});
+
+export const ConversationEntrySchema = z.object({
+  conversationId: z.string(),
+  firstRequest: z.iso.datetime({ offset: true }),
+  lastRequest: z.iso.datetime({ offset: true }),
+  requestCount: z.number().int().nonnegative(),
+  representativeAccount: z.string().nullable().optional().default(null),
+  remainingAccountCount: z.number().int().nonnegative(),
+  apiKeyId: z.string().nullable().optional().default(null),
+  apiKeyName: z.string().nullable().optional().default(null),
+  representativeModel: z.string().nullable().optional().default(null),
+  remainingModelCount: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative().nullable(),
+  totalCostUsd: z.number(),
+});
+
+export const ConversationsResponseSchema = z.object({
+  conversations: z.array(ConversationEntrySchema),
+  total: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+});
+
+export const ConversationDetailsSchema = z.object({
+  conversationId: z.string(),
+  start: z.iso.datetime({ offset: true }),
+  latest: z.iso.datetime({ offset: true }),
+  accountCount: z.number().int().nonnegative(),
+  totalElapsedTime: z.number().int().nonnegative(),
+  dominantUseragentGroup: z.string().nullable().optional().default(null),
+  modelStats: z.array(ConversationModelStatSchema).default([]),
+});
+
+export const ConversationFilterStateSchema = z.object({
+  search: z.string(),
+  limit: z.number().int().positive(),
+  offset: z.number().int().nonnegative(),
+  timeframe: ConversationTimeframeKeySchema,
+});
+
+export type ConversationModelEffort = z.infer<typeof ConversationModelEffortSchema>;
+export type ConversationModelStat = z.infer<typeof ConversationModelStatSchema>;
+export type ConversationEntry = z.infer<typeof ConversationEntrySchema>;
+export type ConversationsResponse = z.infer<typeof ConversationsResponseSchema>;
+export type ConversationDetails = z.infer<typeof ConversationDetailsSchema>;
+export type ConversationFilterState = z.infer<typeof ConversationFilterStateSchema>;

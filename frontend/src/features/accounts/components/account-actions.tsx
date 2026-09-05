@@ -35,7 +35,7 @@ export type AccountActionsProps = {
   onResume: (accountId: string) => void;
   onProbe: (accountId: string) => void;
   onDelete: (accountId: string) => void;
-  onReauth: (accountId: string) => void;
+  onReauth: () => void;
   onExportAuth: (accountId: string) => void;
   onResetCredit: (accountId: string) => void;
   showResetCreditExpiryBadge?: boolean;
@@ -164,7 +164,7 @@ export function AccountActions({
             size="sm"
             variant="outline"
             className="h-8 gap-1.5 text-xs"
-            onClick={() => onReauth(account.accountId)}
+            onClick={onReauth}
             disabled={busy || readOnly}
           >
             <RefreshCw className="h-3.5 w-3.5" />

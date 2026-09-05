@@ -36,7 +36,7 @@ export type AccountDetailProps = {
   onResetUsage: (accountId: string) => void;
   onSetAlias: (accountId: string, alias: string | null) => Promise<unknown>;
   onDelete: (accountId: string) => void;
-  onReauth: (accountId: string) => void;
+  onReauth: () => void;
   onExportAuth: (accountId: string) => void;
   onResetCredit: (accountId: string) => void;
   showResetCreditExpiryBadge?: boolean;

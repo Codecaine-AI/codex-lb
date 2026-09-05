@@ -49,7 +49,7 @@ changes). Layers should be individually re-buildable on top of
 | `project-attribution` | designed | TBD | Request-scoped project label (`X-Project` header / API-key default) persisted on request logs, spend-per-project rollups. See [project-attribution-design.md](project-attribution-design.md). Additive backend + migration; candidate to upstream. |
 | `dashboard-restructure` | implemented | `dashboard-restructure` | Quota-first dashboard relayout: tokens/cost/requests stats, 5h+weekly gauges, accounts sectioned by quota state, banked reset-credit row actions, projections demoted to diagnostics. See [dashboard-restructure-design.md](dashboard-restructure-design.md). Frontend-only; fork-only page + additive route swap, no owned files. |
 | `usage-share-image` | prototyping | `usage-share-image` | Shareable usage-image cards (tokens / est. API cost / requests) for daily/weekly/monthly posting. Phase 1: `/share-lab` preview route rendering the hero + receipt candidates from live data (a gauge variant was prototyped and dropped); phase 2: share dialog with PNG export. Fork-only components + additive route line + additive backend by-model token sums in `/api/reports`. |
-| `fix-targeted-oauth-reauth` | implemented | `fix-targeted-oauth-reauth` | Dashboard re-auth actions carry the selected account id through OAuth and persist refreshed credentials back into that exact account after identity validation. Additive backend + account dashboard wiring. |
+| `fix-targeted-oauth-reauth` | absorbed upstream | — (removed) | Targeted per-account re-auth landed upstream (`OauthStartRequest.account_id` → `intended_account_id`, `ReauthSeatMismatchError`). Fork layer dropped and its OpenSpec change removed in the 2026-09-05 sync; no divergence remains. |
 | `usage-refresh-test-clock` | landed | — (test-only) | Test-only timestamp normalization for usage/account reset fixtures so syncs do not reintroduce naive local-time epoch drift. The `tests/unit/test_usage_updater.py` portion landed upstream as of the 2026-07-29 sync; only `tests/integration/test_accounts_api_extended.py` still diverges. |
 
 ## Fork-only files and directories
@@ -62,13 +62,12 @@ changes). Layers should be individually re-buildable on top of
 | `frontend/src/__integration__/fork-dashboard-routes.test.tsx` | `dashboard-restructure` (+ `/share-lab` case from `usage-share-image`) |
 | `openspec/changes/dashboard-restructure/**` | `dashboard-restructure` |
 | `openspec/changes/usage-share-image/**` | `usage-share-image` |
-| `openspec/changes/fix-targeted-oauth-reauth/**` | `fix-targeted-oauth-reauth` |
 
 ## Upstream files modified — additive
 
 | Path | Layer | What the edit is |
 |------|-------|------------------|
-| `.github/simplicity-budgets.toml` | `dashboard-restructure`, `usage-share-image` | `core_nav` `max_items` raised 5 → 7 for the two fork nav items (Requests, Share). |
+| `.github/simplicity-budgets.toml` | `dashboard-restructure`, `usage-share-image`, `fork-overlay-docs` | `core_nav` `max_items` raised 5 → 7 for the two fork nav items (Requests, Share); `fork-overlay` added to the `[root_files]` allowlist. |
 | `frontend/src/App.tsx` | `dashboard-restructure` | Route swap: `/dashboard` renders `ForkDashboardPage`; `/requests` renders `ForkRequestLogsPage`; upstream page moved to `/upstream-dashboard` (two imports + three route lines). |
 | `frontend/src/App.tsx` | `usage-share-image` | One import + one route line: `/share-lab` renders `ForkShareLabPage` (not in nav). |
 | `app/modules/reports/repository.py` | `usage-share-image` | By-model aggregate also sums input+output tokens (`ModelAggregateRow.tokens`). |
@@ -88,22 +87,11 @@ changes). Layers should be individually re-buildable on top of
 | `frontend/src/i18n/locales/en.json` | `dashboard-restructure`, `usage-share-image` | Two nav keys added: `nav.requests` ("Requests"), `nav.share` ("Share"). |
 | `frontend/src/i18n/locales/zh-CN.json` | `dashboard-restructure`, `usage-share-image` | Two nav keys added: `nav.requests` ("请求"), `nav.share` ("分享"). |
 | `frontend/src/hooks/use-dashboard-preferences.ts` | `dashboard-restructure` | New persisted `forkDiagnosticsOpen` preference (key `codex-lb-fork-diagnostics-open`) following the existing burnrate pattern. |
-| `frontend/src/__integration__/dashboard-flow.test.tsx` | `dashboard-restructure` | Upstream dashboard-flow integration test now targets `/upstream-dashboard` (URL strings only) since `/dashboard` renders the fork page with a 1d default timeframe. |
+| `frontend/src/__integration__/dashboard-flow.test.tsx` | `dashboard-restructure` | Upstream dashboard-flow integration tests target `/upstream-dashboard` (URL strings only) since `/dashboard` renders the fork page with a 1d default timeframe. |
+| `frontend/src/__integration__/dashboard-overview-error.test.tsx` | `dashboard-restructure` | Upstream overview-error tests push `/upstream-dashboard` (URL strings only). |
+| `frontend/src/__integration__/route-recovery-flow.test.tsx` | `dashboard-restructure` | Search-input test targets `/upstream-dashboard`; adds a `vi.mock` of the fork dashboard page mirroring upstream's `DashboardPage` mock so `/dashboard` reload-recovery cases still fail on demand. |
 | `frontend/src/features/reports/components/model-distribution-donut.test.tsx` | `usage-share-image` | Upstream donut test fixture includes the additive `tokens` field expected by fork report schemas. |
 | `frontend/src/__integration__/reports-date-range-flow.test.tsx` | `usage-share-image` | Upstream test fixture includes the additive `tokens` field expected by fork report schemas. |
-| `app/modules/accounts/repository.py` | `fix-targeted-oauth-reauth` | Adds targeted `reauthenticate_account` persistence with ChatGPT/email identity mismatch protection. |
-| `app/modules/oauth/api.py` | `fix-targeted-oauth-reauth` | Preserves `OAuthError.status_code` so missing re-auth targets return 404 instead of a generic 502. |
-| `app/modules/oauth/schemas.py` | `fix-targeted-oauth-reauth` | Adds optional `reauth_account_id` to OAuth start requests. |
-| `app/modules/oauth/service.py` | `fix-targeted-oauth-reauth` | Carries the selected account id through browser, manual-callback, and device OAuth flows; targeted completions update the selected account row and clear routing-unavailable state for the saved account. |
-| `frontend/src/features/accounts/components/account-actions.tsx` | `fix-targeted-oauth-reauth` | Re-authenticate action calls back with the account id. |
-| `frontend/src/features/accounts/components/account-actions.test.tsx` | `fix-targeted-oauth-reauth` | Covers per-account re-auth callback payload. |
-| `frontend/src/features/accounts/components/account-detail.tsx` | `fix-targeted-oauth-reauth` | Threads the account-id reauth callback through the detail component. |
-| `frontend/src/features/accounts/components/accounts-page.tsx` | `fix-targeted-oauth-reauth` | Tracks selected re-auth account id and passes it to OAuth start while keeping Add Account generic. |
-| `frontend/src/features/accounts/hooks/use-oauth.ts` | `fix-targeted-oauth-reauth` | Sends optional `reauthAccountId` in OAuth start payloads. |
-| `frontend/src/features/accounts/hooks/use-oauth.test.ts` | `fix-targeted-oauth-reauth` | Covers OAuth start payloads for selected-account reauth. |
-| `frontend/src/features/accounts/schemas.ts` | `fix-targeted-oauth-reauth` | Adds optional `reauthAccountId` to the frontend OAuth start schema. |
-| `frontend/src/test/mocks/handlers.ts` | `fix-targeted-oauth-reauth` | MSW OAuth start payload schema accepts `reauthAccountId`. |
-| `tests/integration/test_oauth_flow.py` | `fix-targeted-oauth-reauth` | Backend regression coverage for targeted reauth success and identity mismatch failure. |
 | `tests/integration/test_accounts_api_extended.py` | `usage-refresh-test-clock` | Account reset fixtures use UTC epoch conversion helpers instead of local-time `timestamp()` calls. |
 
 ## Upstream files modified — owned

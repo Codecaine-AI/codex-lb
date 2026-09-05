@@ -43,11 +43,7 @@ from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteErr
 from app.core.utils.time import naive_utc_to_epoch, utcnow
 from app.db.models import Account, AccountProxyBinding, AccountStatus
 from app.db.session import get_background_session, sqlite_writer_section
-from app.modules.accounts.repository import (
-    AccountIdentityConflictError,
-    AccountReauthIdentityMismatchError,
-    AccountsRepository,
-)
+from app.modules.accounts.repository import AccountIdentityConflictError, AccountsRepository
 from app.modules.oauth.repository import (
     OAuthFlowRecord,
     OAuthFlowRepository,
@@ -77,7 +73,7 @@ _ACCOUNT_IDENTITY_CONFLICT_MESSAGE = (
     "Multiple accounts match the authenticated identity. Remove duplicate accounts and retry OAuth."
 )
 _REAUTH_SEAT_MISMATCH_MESSAGE = (
-    "The authenticated identity does not match the account being re-authenticated. "
+    "The account you signed in as is not the one being re-authenticated. "
     "No changes were made. Sign out of ChatGPT (or use a private window), then re-run "
     "reauthentication and log in as the exact account that needs repair."
 )
@@ -186,7 +182,6 @@ class OAuthStateStore:
             method=flow.method,
             error_message=flow.error_message,
             state_token=flow.state_token,
-            intended_account_id=flow.intended_account_id,
             code_verifier=flow.code_verifier,
             device_auth_id=flow.device_auth_id,
             user_code=flow.user_code,
@@ -301,7 +296,7 @@ class OAuthCallbackServer:
     async def start(self) -> None:
         app = web.Application()
         app.router.add_get("/auth/callback", self._handler)
-        self._runner = web.AppRunner(app)
+        self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self._host, self._port)
         await self._site.start()
@@ -454,14 +449,7 @@ class OauthService:
 
     async def start_oauth(self, request: OauthStartRequest) -> OauthStartResponse:
         force_method = (request.force_method or "").lower()
-        reauth_account_id = clean_account_identity_part(request.reauth_account_id)
-        if reauth_account_id is not None and await self._accounts_repo.get_by_id(reauth_account_id) is None:
-            raise OAuthError(
-                "reauth_account_not_found",
-                f"Account not found: {reauth_account_id}",
-                status_code=404,
-            )
-        intended_account_id = reauth_account_id or clean_account_identity_part(request.account_id)
+        intended_account_id = clean_account_identity_part(request.account_id)
         if not force_method and not intended_account_id:
             accounts = await self._accounts_repo.list_accounts()
             if accounts:
@@ -691,11 +679,6 @@ class OauthService:
             ):
                 return ManualCallbackResponse(status="success")
             return ManualCallbackResponse(status="error", error_message=_ACCOUNT_IDENTITY_CONFLICT_MESSAGE)
-        except AccountReauthIdentityMismatchError as exc:
-            message = str(exc)
-            if await self._finalize_callback_error(message, flow_id=flow.flow_id) == "success":
-                return ManualCallbackResponse(status="success")
-            return ManualCallbackResponse(status="error", error_message=message)
         except Exception as exc:
             logger.error("manual OAuth callback failed exception_type=%s", type(exc).__name__)
             message = "An internal error occurred."
@@ -840,13 +823,6 @@ class OauthService:
                 == "success"
                 else _error_html(_ACCOUNT_IDENTITY_CONFLICT_MESSAGE)
             )
-        except AccountReauthIdentityMismatchError as exc:
-            message = str(exc)
-            html = (
-                _success_html()
-                if await self._finalize_callback_error(message, flow_id=flow.flow_id) == "success"
-                else _error_html(message)
-            )
 
         asyncio.create_task(self._stop_callback_server_if_idle())
         return self._html_response(html)
@@ -892,9 +868,6 @@ class OauthService:
         except AccountIdentityConflictError:
             if consumed or await self._consume_device_slot(flow_id):
                 await self._set_error(_ACCOUNT_IDENTITY_CONFLICT_MESSAGE, flow_id=flow_id)
-        except AccountReauthIdentityMismatchError as exc:
-            if consumed or await self._consume_device_slot(flow_id):
-                await self._set_error(str(exc), flow_id=flow_id)
         finally:
             async with self._store.lock:
                 flow = self._store.get_flow_locked(flow_id)
@@ -987,11 +960,7 @@ class OauthService:
 
         intended = await repo.get_by_id(intended_account_id)
         if intended is None:
-            raise OAuthError(
-                "reauth_account_not_found",
-                f"Account not found: {intended_account_id}",
-                status_code=404,
-            )
+            raise ReauthSeatMismatchError(None, account.email)
 
         intended_user_id = intended.chatgpt_user_id
         intended_claims = None
@@ -1035,19 +1004,13 @@ class OauthService:
         )
         if workspace_matches and intended.chatgpt_account_id is None and intended_workspace is not None:
             workspace_matches = bool(callback_workspace is not None and callback_workspace == intended_workspace)
-        # Legacy rows may not contain a usable seat claim. In that case the
-        # repository performs the fork's ChatGPT-account/email identity check.
-        seat_matches = not intended_seat_ids or bool(intended_seat_ids & callback_seat_ids)
+        seat_matches = bool(intended_seat_ids & callback_seat_ids)
         if not workspace_matches or not seat_matches:
             raise ReauthSeatMismatchError(intended.email, account.email)
 
         saved = await repo.replace_reauthorized(intended_account_id, account)
         if saved is None:
-            raise OAuthError(
-                "reauth_account_not_found",
-                f"Account not found: {intended_account_id}",
-                status_code=404,
-            )
+            raise ReauthSeatMismatchError(intended.email, account.email)
         return saved
 
     async def _invalidate_account_routing_caches(self) -> None:

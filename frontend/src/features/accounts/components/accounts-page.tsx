@@ -67,7 +67,6 @@ export function AccountsPage() {
   const usageResetDialog = useDialogState<string>();
   const exportDialog = useDialogState<AccountAuthExportResponse>();
   const [deleteHistory, setDeleteHistory] = useState(false);
-  const [reauthAccountId, setReauthAccountId] = useState<string | null>(null);
 
   const accounts = useMemo(
     () => accountsQuery.data ?? [],
@@ -185,7 +184,6 @@ export function AccountsPage() {
                 showResetCreditBadges={showResetCreditBadges}
                 onOpenImport={() => importDialog.show()}
                 onOpenOauth={() => {
-                  setReauthAccountId(null);
                   setOauthAccountId(null);
                   oauthDialog.show();
                 }}
@@ -207,9 +205,8 @@ export function AccountsPage() {
               setAliasMutation.mutateAsync({ accountId, alias })
             }
             onDelete={(accountId) => deleteDialog.show(accountId)}
-            onReauth={(accountId) => {
-              setReauthAccountId(accountId);
-              setOauthAccountId(accountId);
+            onReauth={() => {
+              setOauthAccountId(selectedAccount?.accountId ?? null);
               oauthDialog.show();
             }}
             onExportAuth={(accountId) => {
@@ -270,15 +267,11 @@ export function AccountsPage() {
           onOpenChange={(open) => {
             oauthDialog.onOpenChange(open);
             if (!open) {
-              setReauthAccountId(null);
               setOauthAccountId(null);
             }
           }}
           onStart={async (method) => {
-            await oauth.start(method, {
-              ...(oauthAccountId ? { accountId: oauthAccountId } : {}),
-              ...(reauthAccountId ? { reauthAccountId } : {}),
-            });
+            await oauth.start(method, oauthAccountId ?? undefined);
           }}
           onComplete={async () => {
             await accountsQuery.refetch();

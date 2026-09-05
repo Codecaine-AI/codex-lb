@@ -164,3 +164,4 @@ will refuse to start.
 | Date | Range | Merge | Image | Notes |
 |------|-------|-------|-------|-------|
 | 2026-07-29 | v1.21.0-beta.1 → v1.23.0-beta.2 (208 commits) | `93476aa9` | `codex-lb:main-93476aa9ecd1` | 12 additive conflicts; nav budget 5→7; `test_usage_updater.py` divergence absorbed upstream. |
+| 2026-09-05 | v1.23.0-beta.2 → v1.25.0-beta.1 (331 commits) | _(fill)_ | _(fill)_ | 9 conflicts; `fix-targeted-oauth-reauth` layer absorbed upstream (dropped, OpenSpec change removed); `fork-overlay` added to new `[root_files]` allowlist; upstream deleted `DECISIONS.md`/`SUMMARY.md`. |

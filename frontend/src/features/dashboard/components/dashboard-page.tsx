@@ -1,11 +1,19 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { RefreshCw } from "lucide-react";
+import { Columns3, RefreshCw, RotateCcw } from "lucide-react";
 
 import { AlertMessage } from "@/components/alert-message";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { SpinnerBlock } from "@/components/ui/spinner";
 import { useDialogState } from "@/hooks/use-dialog-state";
 import { useAccountMutations } from "@/features/accounts/hooks/use-accounts";
@@ -15,6 +23,9 @@ import { AccountList } from "@/features/dashboard/components/account-list";
 import { AccountSummaryLine } from "@/features/dashboard/components/account-summary-line";
 import { AccountViewModeToggle } from "@/features/dashboard/components/account-view-mode-toggle";
 import { DashboardSkeleton } from "@/features/dashboard/components/dashboard-skeleton";
+import { ConversationsView } from "@/features/dashboard/components/conversations-view";
+import { ConversationTimeframeSelect } from "@/features/dashboard/components/filters/conversation-timeframe-select";
+import { DashboardViewSelector } from "@/features/dashboard/components/filters/dashboard-view-selector";
 import { OverviewTimeframeSelect } from "@/features/dashboard/components/filters/overview-timeframe-select";
 import { RequestFilters } from "@/features/dashboard/components/filters/request-filters";
 import { RecentRequestsTable } from "@/features/dashboard/components/recent-requests-table";
@@ -23,24 +34,43 @@ import { UsageDonuts } from "@/features/dashboard/components/usage-donuts";
 import { WeeklyCreditsPaceCard } from "@/features/dashboard/components/weekly-credits-pace-card";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
 import { useDashboard, useDashboardProjections } from "@/features/dashboard/hooks/use-dashboard";
+import { useConversations } from "@/features/dashboard/hooks/use-conversations";
+import { useRequestLogTablePreferences } from "@/features/dashboard/hooks/use-request-log-table-preferences";
 import { useRequestLogs } from "@/features/dashboard/hooks/use-request-logs";
+import { REQUEST_LOG_COLUMN_OPTIONS } from "@/features/dashboard/request-log-columns";
 import { buildDashboardView } from "@/features/dashboard/utils";
 import {
   DEFAULT_OVERVIEW_TIMEFRAME,
+  parseDashboardView,
+  parseConversationTimeframe,
   parseOverviewTimeframe,
   type AccountSummary,
+  type ConversationTimeframe,
   type OverviewTimeframe,
 } from "@/features/dashboard/schemas";
 import { useDashboardPreferencesStore } from "@/hooks/use-dashboard-preferences";
 import { useThemeStore } from "@/hooks/use-theme";
 import { REQUEST_STATUS_LABELS } from "@/utils/constants";
+import { getErrorMessageOrNull } from "@/utils/errors";
 import { formatModelLabel, formatCurrency, formatSlug } from "@/utils/formatters";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 
 const MODEL_OPTION_DELIMITER = ":::";
 
+type RetainedDashboardLoadError = {
+  timeframe: OverviewTimeframe;
+  message: string;
+};
+
 export function DashboardPage() {
   const { t, i18n } = useTranslation();
+  const {
+    visibleColumns,
+    columnWidths,
+    toggleColumn,
+    setColumnWidth,
+    restoreDefaultLayout,
+  } = useRequestLogTablePreferences();
   const resolvedLanguage = i18n.resolvedLanguage;
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -52,18 +82,55 @@ export function DashboardPage() {
   const setAccountViewMode = useDashboardPreferencesStore((s) => s.setAccountViewMode);
   const setAccountListSort = useDashboardPreferencesStore((s) => s.setAccountListSort);
   const canWrite = useAuthStore((state) => state.canWrite);
+  const initialized = useAuthStore((state) => state.initialized);
+  const role = useAuthStore((state) => state.role);
+  const isAdmin = initialized && role === "admin";
   const overviewTimeframe = useMemo(
     () => parseOverviewTimeframe(searchParams.get("overviewTimeframe")),
     [searchParams],
   );
-  const dashboardQuery = useDashboard(overviewTimeframe);
+  const conversationTimeframe = useMemo(
+    () => parseConversationTimeframe(searchParams.get("conversationTimeframe")),
+    [searchParams],
+  );
+  const requestedDashboardView = useMemo(
+    () => parseDashboardView(searchParams.get("view")),
+    [searchParams],
+  );
+  const dashboardView = isAdmin ? requestedDashboardView : "request-logs";
+  useEffect(() => {
+    if (!initialized || isAdmin || searchParams.get("view") !== "conversations") {
+      return;
+    }
+    const next = new URLSearchParams(searchParams);
+    next.delete("view");
+    setSearchParams(next, { replace: true });
+  }, [initialized, isAdmin, searchParams, setSearchParams]);
+  // Conversation stats must follow the timeframe restored for the active
+  // view, including when that state came from a bookmarked URL.
+  const dashboardTimeframe =
+    dashboardView === "conversations" ? conversationTimeframe : overviewTimeframe;
+  const dashboardQuery = useDashboard(dashboardTimeframe);
+  const [retainedDashboardLoadError, setRetainedDashboardLoadError] =
+    useState<RetainedDashboardLoadError | null>(null);
+  const [overviewRetryTimeframe, setOverviewRetryTimeframe] =
+    useState<OverviewTimeframe | null>(null);
   const projectionsQuery = useDashboardProjections(Boolean(dashboardQuery.data));
-  const { filters, logsQuery, optionsQuery, updateFilters } = useRequestLogs();
+  const conversationsState = useConversations({
+    enabled: isAdmin && dashboardView === "conversations",
+  });
+  const { conversationsQuery } = conversationsState;
+  const { filters, emptyStateFiltersApplied, logsQuery, optionsQuery, updateFilters } = useRequestLogs({
+    enabled: dashboardView === "request-logs",
+  });
   const { resumeMutation, limitWarmupMutation } = useAccountMutations();
   type ResetCreditDialogTarget = { accountId: string; availableResetCredits: number };
   const resetCreditDialog = useDialogState<ResetCreditDialogTarget>();
 
-  const isRefreshing = dashboardQuery.isFetching || projectionsQuery.isFetching || logsQuery.isFetching;
+  const activeListIsFetching = dashboardView === "request-logs"
+    ? logsQuery.isFetching
+    : conversationsQuery.isFetching;
+  const isRefreshing = dashboardQuery.isFetching || projectionsQuery.isFetching || activeListIsFetching;
 
   const handleRefresh = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
@@ -80,6 +147,29 @@ export function DashboardPage() {
       setSearchParams(next);
     },
     [searchParams, setSearchParams],
+  );
+
+  const handleConversationTimeframeChange = useCallback(
+    (timeframe: ConversationTimeframe) => {
+      conversationsState.updateFilters({ timeframe, offset: 0 });
+    },
+    [conversationsState],
+  );
+
+  const handleDashboardViewChange = useCallback(
+    (nextView: "request-logs" | "conversations") => {
+      if (nextView === "conversations" && !isAdmin) {
+        return;
+      }
+      const next = new URLSearchParams(searchParams);
+      if (nextView === "request-logs") {
+        next.delete("view");
+      } else {
+        next.set("view", nextView);
+      }
+      setSearchParams(next);
+    },
+    [isAdmin, searchParams, setSearchParams],
   );
 
   const handleAccountAction = useCallback(
@@ -271,9 +361,33 @@ export function DashboardPage() {
     [optionsQuery.data?.statuses, t],
   );
 
+  const dashboardLoadError = getErrorMessageOrNull(dashboardQuery.error);
+  if (
+    retainedDashboardLoadError !== null &&
+    (overview || retainedDashboardLoadError.timeframe !== dashboardTimeframe)
+  ) {
+    setRetainedDashboardLoadError(null);
+  } else if (
+    !overview &&
+    dashboardLoadError !== null &&
+    (retainedDashboardLoadError === null ||
+      retainedDashboardLoadError.message !== dashboardLoadError)
+  ) {
+    setRetainedDashboardLoadError({
+      timeframe: dashboardTimeframe,
+      message: dashboardLoadError,
+    });
+  }
+  const displayedDashboardLoadError =
+    dashboardLoadError ??
+    (retainedDashboardLoadError?.timeframe === dashboardTimeframe
+      ? retainedDashboardLoadError.message
+      : null);
+  const overviewRetryBusy =
+    dashboardQuery.isFetching || overviewRetryTimeframe === dashboardTimeframe;
   const errorMessage =
-    (dashboardQuery.error instanceof Error && dashboardQuery.error.message) ||
-    (optionsQuery.error instanceof Error && optionsQuery.error.message) ||
+    (overview ? dashboardLoadError : null) ||
+    (dashboardView === "request-logs" && optionsQuery.error instanceof Error && optionsQuery.error.message) ||
     null;
 
   return (
@@ -287,26 +401,65 @@ export function DashboardPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <OverviewTimeframeSelect
-            value={overviewTimeframe}
-            onChange={handleOverviewTimeframeChange}
-          />
+          {dashboardView === "request-logs" ? (
+            <OverviewTimeframeSelect
+              value={overviewTimeframe}
+              onChange={handleOverviewTimeframeChange}
+            />
+          ) : null}
+          {dashboardView === "conversations" ? (
+            <ConversationTimeframeSelect
+              value={conversationTimeframe}
+              onChange={handleConversationTimeframeChange}
+            />
+          ) : null}
           <button
             type="button"
             onClick={handleRefresh}
             disabled={isRefreshing}
             className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
+            aria-label={t("dashboard.page.refresh")}
             title={t("dashboard.page.refresh")}
           >
-            <RefreshCw className={`h-4 w-4${isRefreshing ? " animate-spin" : ""}`} />
+            <RefreshCw className={`h-4 w-4${isRefreshing ? " animate-spin" : ""}`} aria-hidden="true" />
           </button>
         </div>
       </div>
 
       {errorMessage ? <AlertMessage variant="error">{errorMessage}</AlertMessage> : null}
 
-      {!view ? (
+      {(dashboardQuery.isPending || dashboardQuery.isFetching) &&
+      !view &&
+      displayedDashboardLoadError === null ? (
         <DashboardSkeleton />
+      ) : !view ? (
+        <div className="space-y-3 rounded-xl border bg-card p-4">
+          <div role="alert">
+            <AlertMessage variant="error">{displayedDashboardLoadError ?? "Request failed"}</AlertMessage>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            aria-busy={overviewRetryBusy}
+            disabled={overviewRetryBusy}
+            onClick={() => {
+              const retryTimeframe = dashboardTimeframe;
+              setRetainedDashboardLoadError({
+                timeframe: retryTimeframe,
+                message: displayedDashboardLoadError ?? "Request failed",
+              });
+              setOverviewRetryTimeframe(retryTimeframe);
+              void dashboardQuery.refetch().finally(() => {
+                setOverviewRetryTimeframe((current) =>
+                  current === retryTimeframe ? null : current,
+                );
+              });
+            }}
+          >
+            {t("common.actions.retry")}
+          </Button>
+        </div>
       ) : (
         <>
           <StatsGrid stats={view.stats} />
@@ -340,7 +493,7 @@ export function DashboardPage() {
 
           <section className="space-y-4">
             <div className="flex flex-wrap items-center gap-3">
-              <div className="flex min-w-0 items-center gap-3">
+              <div className="flex min-w-0 flex-wrap items-center gap-3">
                 <h2 className="text-[13px] font-medium uppercase tracking-wider text-muted-foreground">{t("accounts.page.title")}</h2>
                 <AccountSummaryLine accounts={overview?.accounts ?? []} />
               </div>
@@ -361,81 +514,140 @@ export function DashboardPage() {
           </section>
 
           <section className="space-y-4">
-            <div className="flex items-center gap-3">
-              <h2 className="text-[13px] font-medium uppercase tracking-wider text-muted-foreground">{t("dashboard.requests.title")}</h2>
-              <div className="h-px flex-1 bg-border" />
-            </div>
-            {logsQuery.isPending && !logPage ? (
-              <div className="rounded-xl border bg-card py-8">
-                <SpinnerBlock />
-              </div>
-            ) : logsQuery.error ? (
-              <div className="space-y-3 rounded-xl border bg-card p-4">
-                <div role="alert">
-                  <AlertMessage variant="error">{logsQuery.error.message}</AlertMessage>
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    void logsQuery.refetch();
-                  }}
-                  disabled={logsQuery.isFetching}
-                >
-                  {t("common.actions.retry")}
-                </Button>
-              </div>
-            ) : logPage ? (
-              <>
-            <RequestFilters
-              filters={filters}
-              accountOptions={accountOptions}
-              apiKeyOptions={apiKeyOptions}
-              modelOptions={modelOptions}
-              statusOptions={statusOptions}
-              onSearchChange={(search) => updateFilters({ search, offset: 0 })}
-              onTimeframeChange={(timeframe) => updateFilters({ timeframe, offset: 0 })}
-              onAccountChange={(accountIds) => updateFilters({ accountIds, offset: 0 })}
-              onApiKeyChange={(apiKeyIds) => updateFilters({ apiKeyIds, offset: 0 })}
-              onModelChange={(modelOptionsSelected) =>
-                updateFilters({ modelOptions: modelOptionsSelected, offset: 0 })
-              }
-              onStatusChange={(statuses) => updateFilters({ statuses, offset: 0 })}
-              onConversationDismiss={handleConversationDismiss}
-              onReset={() =>
-                updateFilters({
-                  search: "",
-                  timeframe: "all",
-                  accountIds: [],
-                  apiKeyIds: [],
-                  modelOptions: [],
-                  statuses: [],
-                  conversationId: null,
-                  offset: 0,
-                })
-              }
-            />
-            {conversationSummary ? (
-              <div className="rounded-xl border bg-card p-4">
-                <p className="text-sm text-muted-foreground">{conversationSummary}</p>
-              </div>
-            ) : null}
-            <div className="transition-opacity duration-200">
-              <RecentRequestsTable
-                requests={view.requestLogs}
-                accounts={overview?.accounts ?? []}
-                total={logPage?.total ?? 0}
-                limit={filters.limit}
-                offset={filters.offset}
-                hasMore={logPage?.hasMore ?? false}
-                onLimitChange={(limit) => updateFilters({ limit, offset: 0 })}
-                onOffsetChange={(offset) => updateFilters({ offset })}
-                onConversationClick={handleConversationClick}
+            <div className="flex flex-wrap items-center gap-3">
+              <DashboardViewSelector
+                value={dashboardView}
+                onChange={handleDashboardViewChange}
+                showConversations={isAdmin}
               />
+              <div className="h-px min-w-8 flex-1 bg-border" />
+              {dashboardView === "request-logs" ? (
+                <>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button type="button" variant="outline" size="sm">
+                        <Columns3 className="mr-2 h-4 w-4" />
+                        {t("dashboard.requests.columnLayout.columns", {
+                          count: visibleColumns.length,
+                        })}
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-52">
+                      <DropdownMenuLabel>
+                        {t("dashboard.requests.columnLayout.visibleColumns")}
+                      </DropdownMenuLabel>
+                      <DropdownMenuSeparator />
+                      {REQUEST_LOG_COLUMN_OPTIONS.map((column) => {
+                        const isVisible = visibleColumns.includes(column.id);
+                        return (
+                          <DropdownMenuCheckboxItem
+                            key={column.id}
+                            checked={isVisible}
+                            disabled={isVisible && visibleColumns.length === 1}
+                            onCheckedChange={() => toggleColumn(column.id)}
+                            onSelect={(event) => event.preventDefault()}
+                          >
+                            {t(column.translationKey)}
+                          </DropdownMenuCheckboxItem>
+                        );
+                      })}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label={t("dashboard.requests.columnLayout.restoreDefault")}
+                    title={t("dashboard.requests.columnLayout.restoreDefault")}
+                    onClick={restoreDefaultLayout}
+                  >
+                    <RotateCcw className="h-4 w-4" />
+                  </Button>
+                </>
+              ) : null}
             </div>
+            {isAdmin && dashboardView === "conversations" ? (
+              <ConversationsView state={conversationsState} accounts={overview?.accounts ?? []} />
+            ) : (
+              <>
+                {logsQuery.error ? (
+                  <div className="space-y-3 rounded-xl border bg-card p-4">
+                    <div role="alert">
+                      <AlertMessage variant="error">{logsQuery.error.message}</AlertMessage>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        void logsQuery.refetch();
+                      }}
+                      disabled={logsQuery.isFetching}
+                    >
+                      {t("common.actions.retry")}
+                    </Button>
+                  </div>
+                ) : null}
+                {logsQuery.isPending && !logPage ? (
+                  <div className="rounded-xl border bg-card py-8">
+                    <SpinnerBlock />
+                  </div>
+                ) : logPage ? (
+                  <>
+                    <RequestFilters
+                      filters={filters}
+                      accountOptions={accountOptions}
+                      apiKeyOptions={apiKeyOptions}
+                      modelOptions={modelOptions}
+                      statusOptions={statusOptions}
+                      onSearchChange={(search) => updateFilters({ search, offset: 0 })}
+                      onTimeframeChange={(timeframe) => updateFilters({ timeframe, offset: 0 })}
+                      onAccountChange={(accountIds) => updateFilters({ accountIds, offset: 0 })}
+                      onApiKeyChange={(apiKeyIds) => updateFilters({ apiKeyIds, offset: 0 })}
+                      onModelChange={(modelOptionsSelected) =>
+                        updateFilters({ modelOptions: modelOptionsSelected, offset: 0 })
+                      }
+                      onStatusChange={(statuses) => updateFilters({ statuses, offset: 0 })}
+                      onConversationDismiss={handleConversationDismiss}
+                      onReset={() =>
+                        updateFilters({
+                          search: "",
+                          timeframe: "all",
+                          accountIds: [],
+                          apiKeyIds: [],
+                          modelOptions: [],
+                          statuses: [],
+                          conversationId: null,
+                          offset: 0,
+                        })
+                      }
+                    />
+                    {conversationSummary ? (
+                      <div className="rounded-xl border bg-card p-4">
+                        <p className="text-sm text-muted-foreground">{conversationSummary}</p>
+                      </div>
+                    ) : null}
+                    <div className="transition-opacity duration-200">
+                      <RecentRequestsTable
+                        requests={view.requestLogs}
+                        accounts={overview?.accounts ?? []}
+                        total={logPage.total}
+                        visibleColumns={visibleColumns}
+                        columnWidths={columnWidths}
+                        onColumnWidthChange={setColumnWidth}
+                        limit={filters.limit}
+                        offset={filters.offset}
+                        hasMore={logPage.hasMore}
+                        filtersApplied={emptyStateFiltersApplied}
+                        onLimitChange={(limit) => updateFilters({ limit, offset: 0 })}
+                        onOffsetChange={(offset) => updateFilters({ offset })}
+                        onConversationClick={handleConversationClick}
+                      />
+                    </div>
+                  </>
+                ) : null}
               </>
-            ) : null}
+            )}
           </section>
         </>
       )}

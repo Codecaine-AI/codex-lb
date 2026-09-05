@@ -14,6 +14,7 @@ LOCAL_OVERLOAD_CODES = frozenset(
         LOCAL_OVERLOAD_CODE,
         "account_response_create_cap",
         "account_stream_cap",
+        "api_key_stream_fair_share",
         "bridge_queue_full",
         "response_create_gate_timeout",
         "global_admission_timeout",
@@ -45,7 +46,7 @@ def merge_retry_after_headers(
 
 
 def is_proxy_path(path: str) -> bool:
-    return path.startswith("/v1/") or path.startswith("/backend-api/")
+    return path in {"/v1", "/backend-api"} or path.startswith(("/v1/", "/backend-api/"))
 
 
 async def send_json_http_response(
